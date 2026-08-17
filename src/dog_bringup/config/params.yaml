@@ -1,0 +1,80 @@
+# =====================================================================
+# 巡检检测系统集中参数 (dog_bringup/config/params.yaml)
+# 全部使用标准消息, 无自定义消息
+# =====================================================================
+#
+# 奥比中光 Gemini 335L (orbbec_camera) 话题:
+#   彩色图:   /camera/color/image_raw        (1280x800 rgb8)
+#   深度图:   /camera/depth/image_raw        (1280x800 16UC1, mm)
+#   相机内参: /camera/color/camera_info
+#   坐标系:   camera_color_optical_frame (驱动发布 camera_link 为父系)
+#
+# 模型 (随 dog_ai_detection 包安装到 models/):
+#   yolo26n.engine/pt   COCO 80 类 (车辆/行人)
+#   helmet.pt           PPE: Helm/No_Helm/No_Vest/Vest
+#   model_path 留空 "" 表示使用包内默认模型; 也可填绝对路径
+#
+# 注意: rclpy 不支持 YAML 空数组 (会报参数未初始化), 空值请直接省略
+# =====================================================================
+
+# ------------------- 节点 1: 车辆违规停放 + 行人(测试) -----------------
+parking_detection_node:
+  ros__parameters:
+    color_topic: "/camera/color/image_raw"
+    depth_topic: "/camera/depth/image_raw"
+    camera_info_topic: "/camera/color/camera_info"
+    result_image_topic: "/detection/result_image"
+    object_markers_topic: "/detection/object_markers"
+    zone_markers_topic: "/detection/map_markers"
+    alert_topic: "/detection/alert"
+    web_json_topic: "/detection/web_json"
+    camera_frame: "camera_color_optical_frame"
+    map_frame: "map"
+    zone_frame: "map"
+    model_path: ""
+    vehicle_classes: ["car", "truck", "bus", "motorcycle"]
+    person_classes: ["person"]
+    conf_threshold: 0.5
+    iou_threshold: 0.45
+    marker_lifetime: 0.5
+    embed_image_in_json: false
+    show_gui: false
+    gui_scale: 0.6
+    result_image_scale: 0.6
+    publish_image: true
+    inference_period_ms: 100
+    sync_slop: 0.2
+    depth_scale: 0.001
+    max_depth: 8.0
+    # 禁停区域多边形 (map 坐标, 米, 扁平坐标 [x1,y1,x2,y2,...])
+    # 例: parking_zone: [1.0, 1.0, 4.0, 1.0, 4.0, 3.0, 1.0, 3.0]
+    # 无地图时 map 与 camera_link 重合, 可用相机附近坐标标定
+
+# ------------------- 节点 2: 安全帽 / 安全服 ---------------------------
+helmet_vest_detection_node:
+  ros__parameters:
+    color_topic: "/camera/color/image_raw"
+    depth_topic: "/camera/depth/image_raw"
+    camera_info_topic: "/camera/color/camera_info"
+    result_image_topic: "/detection/ppe_result_image"
+    object_markers_topic: "/detection/object_markers"
+    zone_markers_topic: "/detection/map_markers"
+    alert_topic: "/detection/alert"
+    web_json_topic: "/detection/web_json"
+    camera_frame: "camera_color_optical_frame"
+    map_frame: "map"
+    zone_frame: "map"
+    model_path: ""
+    ppe_classes: ["Helm", "No_Helm", "No_Vest", "Vest"]
+    conf_threshold: 0.4
+    iou_threshold: 0.45
+    marker_lifetime: 0.5
+    embed_image_in_json: false
+    show_gui: false
+    gui_scale: 0.6
+    result_image_scale: 0.6
+    publish_image: true
+    inference_period_ms: 100
+    sync_slop: 0.2
+    depth_scale: 0.001
+    max_depth: 8.0
