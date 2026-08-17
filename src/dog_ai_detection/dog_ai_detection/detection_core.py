@@ -3,21 +3,13 @@
 """
 dog_ai_detection.detection_core
 ===============================
-共享检测核心 (仅标准消息, 无自定义消息):
-
-    YoloDetector          多后端推理引擎 (ultralytics / TensorRT / ONNX)
-    BaseVizDetectionNode  可视化检测节点基类: 彩色+深度同步订阅 -> 推理 ->
-                          像素+深度->3D -> TF->map -> 任务组标记/MarkerArray
-                          -> 画面标注 -> OpenCV 窗口 / RViz 画面
-
-任务拆分架构 (后续叠加新检测任务只需新增一个子类文件 + 脚本入口):
-    yolo26n (COCO)  -> parking_detection_node     车辆违规停放 + 行人(测试)
-    helmet.pt (PPE) -> helmet_vest_detection_node 安全帽 / 安全服
-    future_model    -> xxx_detection_node          后续任务...
+共享检测核心 (标准消息: MarkerArray / Image / Bool / String)
 """
 
 import os
 import threading
+import json
+import base64
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
@@ -25,18 +17,19 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
+from std_msgs.msg import Bool, String
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point, PointStamped
+from tf2_geometry_msgs import do_transform_point
+from tf2_ros import Buffer, TransformListener
+import message_filters
 
-# 包内模型目录 (模型文件随 Python 包一起安装)
 MODELS_DIR = os.path.join(os.path.dirname(__file__), 'models')
 
 
 class YoloDetector:
-    """多后端 YOLO 推理引擎.
-
-    infer() 统一返回:
-        [{'class_name': str, 'score': float, 'bbox': [x1, y1, x2, y2]}, ...]
-    """
+    """多后端 YOLO 推理引擎."""
 
     def __init__(self, model_path: str, conf_threshold: float = 0.5,
                  iou_threshold: float = 0.45, class_names=None,
@@ -68,11 +61,10 @@ class YoloDetector:
         self._trt_output_dtype = None
         self._ort_input_name = None
 
-    # ------------------------------------------------------------------ #
     def load(self) -> bool:
         ext = os.path.splitext(self.model_path)[1].lower()
         if ext == '.engine':
-            ok = self._try_ultralytics() or self._try_tensorrt()
+            ok = self._try_tensorrt() or self._try_ultralytics()
         elif ext == '.onnx':
             ok = self._try_onnxruntime()
         else:
@@ -84,8 +76,7 @@ class YoloDetector:
         try:
             from ultralytics import YOLO
         except ImportError:
-            self.last_error = ('ultralytics 后端需要 PyTorch, 请安装: '
-                               'pip install ultralytics (Jetson 需 NVIDIA 提供的 torch wheel)')
+            self.last_error = 'ultralytics 需要 PyTorch: pip install ultralytics'
             return False
         try:
             self._model = YOLO(self.model_path, task='detect')
@@ -94,8 +85,8 @@ class YoloDetector:
                 self._names = {int(k): str(v) for k, v in names.items()}
             self._backend = 'ultralytics'
             return True
-        except Exception as exc:  # noqa: BLE001
-            self.last_error = f'ultralytics 加载模型失败: {exc}'
+        except Exception as exc:
+            self.last_error = f'ultralytics 加载失败: {exc}'
             return False
 
     def _infer_ultralytics(self, bgr):
@@ -123,9 +114,7 @@ class YoloDetector:
             import tensorrt as trt
             import pycuda.driver as cuda
         except ImportError as exc:
-            missing = getattr(exc, 'name', '')
-            self.last_error = (f'原生 TensorRT 后端缺少依赖 {missing or exc}, '
-                               '请执行: pip install pycuda')
+            self.last_error = f'原生 TensorRT 缺少依赖: {exc}'
             return False
         try:
             logger = trt.Logger(trt.Logger.WARNING)
@@ -135,16 +124,14 @@ class YoloDetector:
                 raise RuntimeError('deserialize_cuda_engine 返回 None')
             self._cuda = cuda
             self._trt = trt
-            # 显式创建 CUDA Context (不使用 autoinit, 保证多线程执行器下安全)
             self._cuda_ctx = cuda.Device(0).make_context()
             self._engine = engine
             self._context = engine.create_execution_context()
-            self._trt_bindings = []
             self._setup_trt_bindings()
             self._backend = 'tensorrt'
-            self._cuda_ctx.pop()   # 归还上下文栈, infer() 时再 push
+            self._cuda_ctx.pop()
             return True
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.last_error = f'TensorRT 加载失败: {exc}'
             return False
 
@@ -175,7 +162,6 @@ class YoloDetector:
         img, ratio, (dw, dh) = self._letterbox(bgr, (iw, ih))
         blob = img[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
         blob = np.ascontiguousarray(blob[None]).astype(self._trt_input_dtype)
-        # 显式绑定 CUDA Context, 保证任意线程调用 infer 都安全
         self._cuda_ctx.push()
         try:
             self._cuda.memcpy_htod(self._trt_input_dev, blob)
@@ -196,8 +182,7 @@ class YoloDetector:
         try:
             self._ort = ort.InferenceSession(
                 self.model_path,
-                providers=['CUDAExecutionProvider', 'TensorrtExecutionProvider',
-                           'CPUExecutionProvider'])
+                providers=['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CPUExecutionProvider'])
             in_meta = self._ort.get_inputs()[0]
             self._ort_input_name = in_meta.name
             shape = list(in_meta.shape)
@@ -206,8 +191,8 @@ class YoloDetector:
             self._input_shape = (1, 3, ih, iw)
             self._backend = 'onnxruntime'
             return True
-        except Exception as exc:  # noqa: BLE001
-            self.last_error = f'onnxruntime 加载模型失败: {exc}'
+        except Exception as exc:
+            self.last_error = f'onnxruntime 加载失败: {exc}'
             return False
 
     def _infer_onnxruntime(self, bgr):
@@ -218,7 +203,6 @@ class YoloDetector:
         out = self._ort.run(None, {self._ort_input_name: blob})[0]
         return self._decode_yolo_output(out, ratio, dw, dh, bgr.shape)
 
-    # ------------------------------ 公共解码 ------------------------------
     @staticmethod
     def _letterbox(img, new_shape=(640, 640), color=(114, 114, 114)):
         h, w = img.shape[:2]
@@ -271,7 +255,6 @@ class YoloDetector:
             })
         return dets
 
-    # ------------------------------ 统一入口 ------------------------------
     def infer(self, bgr) -> list:
         if self._backend == 'ultralytics':
             return self._infer_ultralytics(bgr)
@@ -283,19 +266,7 @@ class YoloDetector:
 
 
 class BaseVizDetectionNode(Node):
-    """可视化检测节点基类 (标准消息: MarkerArray / Image / Bool / String).
-
-    子类只需覆盖:
-        TASK_NODE_NAME   节点名
-        MODEL_CANDIDATES 模型文件候选 (包内 models/ 目录, 按顺序找)
-        _declare_task_params()  声明本任务参数 (如类别表 / 画面话题)
-        build_groups()          返回任务组列表:
-            {'name': ..., 'classes': [...], 'offset': 标记ID偏移,
-             'zones': 是否做禁停区判定,
-             'violation_classes': 类别即违规 (如 No_Helm/No_Vest),
-             'color_ok'/'color_vio' (RGB), 'color_ok_bgr'/'color_vio_bgr'}
-        _check_violation()      可选, 覆盖自定义违规规则
-    """
+    """可视化检测节点基类."""
 
     TASK_NODE_NAME = 'detection_node'
     MODEL_CANDIDATES = ('yolo26n.engine', 'yolo26n.pt')
@@ -303,7 +274,6 @@ class BaseVizDetectionNode(Node):
     def __init__(self):
         super().__init__(self.TASK_NODE_NAME)
 
-        # ------------------------------ 参数 ------------------------------
         self._declare_task_params()
         self.declare_parameter('color_topic', '/camera/color/image_raw')
         self.declare_parameter('depth_topic', '/camera/depth/image_raw')
@@ -316,7 +286,7 @@ class BaseVizDetectionNode(Node):
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('zone_frame', 'map')
         self.declare_parameter('model_path', '')
-        self.declare_parameter('class_names', [])   # TRT/ONNX 后端 id->名称
+        self.declare_parameter('class_names', [])
         self.declare_parameter('conf_threshold', 0.5)
         self.declare_parameter('iou_threshold', 0.45)
         self.declare_parameter('marker_lifetime', 0.5)
@@ -338,7 +308,6 @@ class BaseVizDetectionNode(Node):
         if not self._groups:
             self.get_logger().warn('任务组为空, 不会输出任何检测结果')
 
-        # ------------------------------ 状态 ------------------------------
         self._bridge = CvBridge()
         self._color = None
         self._depth = None
@@ -346,15 +315,13 @@ class BaseVizDetectionNode(Node):
         self._header = None
         self._frame_dets = []
         self._fx = self._fy = self._cx = self._cy = None
-        # 图像缓冲保护 (多线程执行器下防竞争; 单线程下也有序)
+        
         self._frame_lock = threading.Lock()
-        self._frame_seq = 0          # 新帧计数
-        self._processed_seq = -1     # 已处理帧计数 (防重复处理/跳帧)
-        # 异步 JPEG 编码 + JSON 上报 (避免阻塞检测主循环)
+        self._frame_seq = 0
+        self._processed_seq = -1
         self._encoder = ThreadPoolExecutor(max_workers=1)
         self._encode_busy = False
 
-        from tf2_ros import Buffer, TransformListener
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
@@ -364,50 +331,35 @@ class BaseVizDetectionNode(Node):
             iou_threshold=self.iou_threshold,
             class_names=self.class_names)
         if self._engine.load():
-            self.get_logger().info(
-                f'Model loaded (backend={self._engine._backend}): {self.model_path}')
+            self.get_logger().info(f'Model loaded (backend={self._engine._backend}): {self.model_path}')
         else:
-            self.get_logger().error(
-                f'Inference engine unavailable: {self._engine.last_error}')
+            self.get_logger().error(f'Inference engine unavailable: {self._engine.last_error}')
 
-        # ------------------------------ 通信 ------------------------------
-        import message_filters
-        from sensor_msgs.msg import CameraInfo
-        self._cam_info_sub = self.create_subscription(
-            CameraInfo, self.camera_info_topic, self._camera_info_cb, 10)
+        self._cam_info_sub = self.create_subscription(CameraInfo, self.camera_info_topic, self._camera_info_cb, 10)
         self._color_sub = message_filters.Subscriber(self, Image, self.color_topic)
         self._depth_sub = message_filters.Subscriber(self, Image, self.depth_topic)
         self._sync = message_filters.ApproximateTimeSynchronizer(
             [self._color_sub, self._depth_sub], queue_size=2, slop=float(self.sync_slop))
         self._sync.registerCallback(self._image_sync_cb)
 
-        from std_msgs.msg import Bool, String
-        from visualization_msgs.msg import MarkerArray
         self._img_pub = self.create_publisher(Image, self.result_image_topic, 10)
         self._marker_pub = self.create_publisher(MarkerArray, self.object_markers_topic, 10)
         self._zone_pub = self.create_publisher(MarkerArray, self.zone_markers_topic, 10)
         self._alert_pub = self.create_publisher(Bool, self.alert_topic, 10)
         self._json_pub = self.create_publisher(String, self.web_json_topic, 10)
 
-        # ------------------------------ 定时器 ------------------------------
         self._timer = self.create_timer(self.inference_period_ms / 1000.0, self._process_tick)
         self._zone_timer = self.create_timer(1.0, self._publish_zones)
 
-        self.get_logger().info(
-            f'[{self.get_name()}] started: color={self.color_topic}, '
-            f'depth={self.depth_topic}, groups='
-            + ','.join(g['name'] for g in self._groups))
+        self.get_logger().info(f'[{self.get_name()}] started: color={self.color_topic}, depth={self.depth_topic}')
 
-    # ------------------------------------------------------------------ #
     def _declare_task_params(self):
-        """子类钩子: 声明任务参数 (在公共参数之前调用)."""
+        pass
 
     def build_groups(self) -> list:
-        """子类覆盖: 返回任务组列表."""
         return []
 
     def _check_violation(self, gname, det, mx, my):
-        """违规判定: 类别即违规 > 禁停区域判定. 子类可覆盖."""
         g = self._group_by_name(gname)
         if g is None:
             return None
@@ -420,7 +372,6 @@ class BaseVizDetectionNode(Node):
     def _group_by_name(self, gname):
         return next((g for g in self._groups if g['name'] == gname), None)
 
-    # ------------------------------------------------------------------ #
     def _load_params(self):
         self.color_topic = self.get_parameter('color_topic').value
         self.depth_topic = self.get_parameter('depth_topic').value
@@ -449,15 +400,11 @@ class BaseVizDetectionNode(Node):
 
         parking_flat = list(self.get_parameter('parking_zone').value)
         fire_flat = list(self.get_parameter('fire_lane_zone').value)
-        self.parking_zone = [tuple(parking_flat[i:i + 2])
-                             for i in range(0, len(parking_flat) - 1, 2)]
-        self.fire_lane_zone = [tuple(fire_flat[i:i + 2])
-                               for i in range(0, len(fire_flat) - 1, 2)]
-        # 预转 numpy 数组 (cv2.pointPolygonTest 需要, C++ 底层判定)
-        self.parking_zone_np = np.asarray(
-            self.parking_zone, dtype=np.float32).reshape(-1, 1, 2)
-        self.fire_lane_zone_np = np.asarray(
-            self.fire_lane_zone, dtype=np.float32).reshape(-1, 1, 2)
+        self.parking_zone = [tuple(parking_flat[i:i + 2]) for i in range(0, len(parking_flat) - 1, 2)]
+        self.fire_lane_zone = [tuple(fire_flat[i:i + 2]) for i in range(0, len(fire_flat) - 1, 2)]
+        
+        self.parking_zone_np = np.array(self.parking_zone, dtype=np.float32) if len(self.parking_zone) >= 3 else None
+        self.fire_lane_zone_np = np.array(self.fire_lane_zone, dtype=np.float32) if len(self.fire_lane_zone) >= 3 else None
 
     def _resolve_model(self, value: str) -> str:
         if value:
@@ -466,21 +413,14 @@ class BaseVizDetectionNode(Node):
             p = os.path.join(MODELS_DIR, name)
             if os.path.isfile(p):
                 if name != self.MODEL_CANDIDATES[0]:
-                    self.get_logger().warn(
-                        f'未找到首选模型 {self.MODEL_CANDIDATES[0]}, 回退使用 {name} '
-                        '(若检测类别与预期不符, 请放入训练好的专用模型)')
+                    self.get_logger().warn(f'未找到首选模型 {self.MODEL_CANDIDATES[0]}, 回退使用 {name}')
                 return p
         return os.path.join(MODELS_DIR, self.MODEL_CANDIDATES[0])
 
-    # ------------------------------------------------------------------ #
-    # 回调: 相机内参 / 彩色+深度同步帧
-    # ------------------------------------------------------------------ #
     def _camera_info_cb(self, msg):
         self._fx, self._fy = float(msg.k[0]), float(msg.k[4])
         self._cx, self._cy = float(msg.k[2]), float(msg.k[5])
-        self.get_logger().info(
-            f'Intrinsics: fx={self._fx:.2f} fy={self._fy:.2f} '
-            f'cx={self._cx:.2f} cy={self._cy:.2f}', once=True)
+        self.get_logger().info(f'Intrinsics: fx={self._fx:.2f} fy={self._fy:.2f} cx={self._cx:.2f} cy={self._cy:.2f}', once=True)
 
     def _image_sync_cb(self, color_msg, depth_msg):
         try:
@@ -499,16 +439,11 @@ class BaseVizDetectionNode(Node):
                 self._depth_is_meters = is_meters
                 self._header = color_msg.header
                 self._frame_seq += 1
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.get_logger().warn(f'Image sync conversion failed: {exc}')
 
-    # ------------------------------------------------------------------ #
-    # 几何工具: Marker / 多边形 / 深度 / 3D / TF
-    # ------------------------------------------------------------------ #
-    def _create_marker(self, mtype, mid, pose, scale, color, ns='default',
-                       frame_id=None, text=''):
+    def _create_marker(self, mtype, mid, pose, scale, color, ns='default', frame_id=None, text=''):
         from rclpy.duration import Duration
-        from visualization_msgs.msg import Marker
         m = Marker()
         m.header.frame_id = frame_id or self.zone_frame
         m.header.stamp = self.get_clock().now().to_msg()
@@ -528,28 +463,25 @@ class BaseVizDetectionNode(Node):
         return m
 
     def _check_zones(self, x, y):
-        """禁停区域判定 (cv2.pointPolygonTest, C++ 底层实现)."""
-        if (len(self.parking_zone_np) >= 3 and
-                cv2.pointPolygonTest(self.parking_zone_np, (float(x), float(y)), False) >= 0):
+        pt = (float(x), float(y))
+        if self.parking_zone_np is not None and cv2.pointPolygonTest(self.parking_zone_np, pt, False) >= 0:
             return 'illegal_parking'
-        if (len(self.fire_lane_zone_np) >= 3 and
-                cv2.pointPolygonTest(self.fire_lane_zone_np, (float(x), float(y)), False) >= 0):
+        if self.fire_lane_zone_np is not None and cv2.pointPolygonTest(self.fire_lane_zone_np, pt, False) >= 0:
             return 'fire_lane_occupation'
         return None
 
-    def _depth_at_center(self, x1, y1, x2, y2):
-        with self._frame_lock:
-            if self._depth is None:
-                return None
-            h, w = self._depth.shape[:2]
-            cx = int(np.clip((x1 + x2) / 2, 0, w - 1))
-            cy = int(np.clip((y1 + y2) / 2, 0, h - 1))
-            roi = self._depth[max(0, cy - 2):cy + 3, max(0, cx - 2):cx + 3].copy()
+    def _depth_at_center(self, x1, y1, x2, y2, depth_mat, is_meters):
+        if depth_mat is None:
+            return None
+        h, w = depth_mat.shape[:2]
+        cx = int(np.clip((x1 + x2) / 2, 0, w - 1))
+        cy = int(np.clip((y1 + y2) / 2, 0, h - 1))
+        roi = depth_mat[max(0, cy - 2):cy + 3, max(0, cx - 2):cx + 3]
         valid = roi[roi > 0]
         if len(valid) == 0:
             return None
         value = float(np.median(valid))
-        return value if self._depth_is_meters else value * self.depth_scale
+        return value if is_meters else value * self.depth_scale
 
     def _to_camera_3d(self, x1, y1, x2, y2, depth_m):
         u, v = (x1 + x2) / 2.0, (y1 + y2) / 2.0
@@ -558,21 +490,15 @@ class BaseVizDetectionNode(Node):
                 depth_m)
 
     def _lookup_frame_tf(self):
-        """每帧只调用一次: 缓存 camera->map 变换, 失败返回 None."""
         import rclpy.time
         try:
             return self._tf_buffer.lookup_transform(
                 self.map_frame, self.camera_frame, rclpy.time.Time())
-        except Exception as exc:  # noqa: BLE001
-            self.get_logger().warn(
-                f'TF {self.camera_frame}->{self.map_frame} failed: {exc}',
-                throttle_duration_sec=5.0)
+        except Exception as exc:
+            self.get_logger().warn(f'TF {self.camera_frame}->{self.map_frame} failed: {exc}', throttle_duration_sec=5.0)
             return None
 
     def _transform_point_to_map(self, px, py, pz, frame_tf):
-        """用已缓存的变换把单个相机 3D 点转到 map (不触发 TF 查询)."""
-        from geometry_msgs.msg import Point, PointStamped
-        from tf2_geometry_msgs import do_transform_point
         pt = PointStamped()
         pt.header.frame_id = self.camera_frame
         pt.header.stamp = frame_tf.header.stamp
@@ -580,47 +506,33 @@ class BaseVizDetectionNode(Node):
         out = do_transform_point(pt, frame_tf)
         return out.point.x, out.point.y, out.point.z
 
-    # ------------------------------------------------------------------ #
-    # 定时: 一次推理 -> 分组提取 -> 画面标注 -> 3D 标记 -> 告警
-    # ------------------------------------------------------------------ #
     def _process_tick(self):
-        if self._color is None or self._fx is None:
+        if not rclpy.ok() or self._fx is None:
             return
+
         with self._frame_lock:
-            if self._frame_seq == self._processed_seq:
-                return                    # 无新帧, 不重复处理
+            if self._color is None or self._frame_seq == self._processed_seq:
+                return
             frame = self._color.copy()
+            depth_mat = self._depth.copy() if self._depth is not None else None
+            is_meters = self._depth_is_meters
             self._processed_seq = self._frame_seq
 
-        # 模型每帧只推理一次
         raw_dets = self._engine.infer(frame)
         self._frame_dets = raw_dets
-        # 单帧只查询一次 TF (失败则本帧跳过 3D/Map 计算)
         frame_tf = self._lookup_frame_tf()
-        groups = {g['name']: [d for d in raw_dets if d['class_name'] in g['classes']]
-                  for g in self._groups}
+        groups = {g['name']: [d for d in raw_dets if d['class_name'] in g['classes']] for g in self._groups}
 
-        from std_msgs.msg import Bool
-        from visualization_msgs.msg import Marker, MarkerArray
-        import json
-        from std_msgs.msg import String
         markers = MarkerArray()
         violations = []
         alert = False
-
-        # 画面: 全部检测画灰色细框
-        for det in raw_dets:
-            x1, y1, x2, y2 = [int(v) for v in det['bbox'][:4]]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (128, 128, 128), 1)
-            cv2.putText(frame, det['class_name'], (x1, max(y1 - 6, 12)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (128, 128, 128), 1)
 
         for gname, dets in groups.items():
             g = self._group_by_name(gname)
             for i, det in enumerate(dets):
                 x1, y1, x2, y2 = [int(v) for v in det['bbox'][:4]]
 
-                depth_m = self._depth_at_center(x1, y1, x2, y2)
+                depth_m = self._depth_at_center(x1, y1, x2, y2, depth_mat, is_meters)
                 if depth_m is None or depth_m > self.max_depth:
                     depth_m = None
                 mapp = None
@@ -634,33 +546,29 @@ class BaseVizDetectionNode(Node):
                 if is_violation:
                     alert = True
 
-                # 画面标注 (分组彩色框)
                 c = g['color_vio_bgr'] if is_violation else g['color_ok_bgr']
-                label = "{} {:.2f}".format(det['class_name'], float(det['score']))
+                label = f"{det['class_name']} {float(det['score']):.2f}"
                 if depth_m is not None:
-                    label += " {:.2f}m".format(depth_m)
+                    label += f" {depth_m:.2f}m"
                 if zone:
-                    label += " [" + zone + "]"
+                    label += f" [{zone}]"
                 cv2.rectangle(frame, (x1, y1), (x2, y2), c, 2)
                 ty = y2 + 18 if y2 + 18 < frame.shape[0] else y1 - 6
-                cv2.putText(frame, label, (x1, ty),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, c, 2)
+                cv2.putText(frame, label, (x1, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, c, 2)
 
-                # 3D 标记 (需要有效深度 + TF)
                 if mapp is not None:
                     bw = (x2 - x1) * depth_m / self._fx
                     bh = (y2 - y1) * depth_m / self._fy
-                    rgba = (g['color_vio'] + (0.8,) if is_violation
-                            else g['color_ok'] + (0.7,))
+                    rgba = g['color_vio'] + (0.8,) if is_violation else g['color_ok'] + (0.7,)
                     base = g['offset'] + i * 2
                     markers.markers.append(self._create_marker(
                         Marker.CUBE, base, (mx, my, depth_m / 2.0),
                         (max(bw, 0.2), max(bh, 0.2), 0.2), rgba,
-                        ns=gname + '_objects', frame_id=self.map_frame))
+                        ns=f"{gname}_objects", frame_id=self.map_frame))
                     markers.markers.append(self._create_marker(
                         Marker.TEXT_VIEW_FACING, base + 1,
                         (mx, my, depth_m / 2.0 + 0.35), (0, 0, 0.35),
-                        (1.0, 1.0, 1.0, 1.0), ns=gname + '_labels',
+                        (1.0, 1.0, 1.0, 1.0), ns=f"{gname}_labels",
                         frame_id=self.map_frame, text=label))
 
                 if is_violation:
@@ -668,17 +576,19 @@ class BaseVizDetectionNode(Node):
                         'class_name': det['class_name'],
                         'violation': zone,
                         'confidence': round(float(det['score']), 3),
-                        'position': ({'x': round(mx, 3), 'y': round(my, 3),
-                                      'z': round(mz, 3)} if mapp is not None else None),
+                        'position': {'x': round(mx, 3), 'y': round(my, 3), 'z': round(mz, 3)} if mapp is not None else None,
                     })
+
+        # 退出安全发布
+        if not rclpy.ok():
+            return
 
         self._marker_pub.publish(markers)
 
         if self.show_gui:
             self._show_gui(frame)
         if self.publish_image:
-            self._img_pub.publish(self._to_image_msg(
-                self._resize(frame, self.result_image_scale)))
+            self._img_pub.publish(self._to_image_msg(self._resize(frame, self.result_image_scale)))
 
         if alert:
             self._alert_pub.publish(Bool(data=True))
@@ -691,16 +601,12 @@ class BaseVizDetectionNode(Node):
                 'violations': violations,
             }
             if self.embed_image_in_json:
-                # 异步 JPEG 编码 + 发布 (后台线程, 忙时丢弃本帧防积压)
                 if not self._encode_busy:
                     self._encode_busy = True
-                    self._encoder.submit(
-                        self._encode_and_publish, frame.copy(), payload)
+                    self._encoder.submit(self._encode_and_publish, frame.copy(), payload)
             else:
-                self._json_pub.publish(
-                    String(data=json.dumps(payload, ensure_ascii=False)))
+                self._json_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
 
-    # ------------------------------------------------------------------ #
     @staticmethod
     def _resize(frame, scale):
         if scale >= 1.0:
@@ -711,22 +617,19 @@ class BaseVizDetectionNode(Node):
 
     def _show_gui(self, frame):
         view = self._resize(frame, self.gui_scale)
-        cv2.imshow('Detection - {}'.format(self.get_name()), view)
+        cv2.imshow(f'Detection - {self.get_name()}', view)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             self.get_logger().info('GUI: q pressed, shutting down')
             raise KeyboardInterrupt
 
     def _encode_and_publish(self, frame, payload):
-        """后台线程: JPEG 压缩 + Base64 + JSON 发布 (不阻塞检测主循环)."""
-        from std_msgs.msg import String
-        import json
         try:
             ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
             if ok:
-                import base64
                 payload['image_base64'] = base64.b64encode(buf).decode('utf-8')
-            self._json_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
-        except Exception as exc:  # noqa: BLE001
+            if rclpy.ok():
+                self._json_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
+        except Exception as exc:
             self.get_logger().error(f'Async JSON publish failed: {exc}')
         finally:
             self._encode_busy = False
@@ -747,12 +650,9 @@ class BaseVizDetectionNode(Node):
         msg.data = frame.tobytes()
         return msg
 
-    # ------------------------------------------------------------------ #
-    # 定时: 发布禁停区域轮廓 (仅停车任务配置区域时可见)
-    # ------------------------------------------------------------------ #
     def _publish_zones(self):
-        from geometry_msgs.msg import Point
-        from visualization_msgs.msg import Marker, MarkerArray
+        if not rclpy.ok():
+            return
         arr = MarkerArray()
         zones = [('parking', self.parking_zone, (0.0, 1.0, 0.0, 1.0)),
                  ('fire_lane', self.fire_lane_zone, (1.0, 0.6, 0.0, 1.0))]
@@ -771,6 +671,6 @@ class BaseVizDetectionNode(Node):
             cy = sum(p[1] for p in poly) / len(poly)
             arr.markers.append(self._create_marker(
                 Marker.TEXT_VIEW_FACING, mid + 100, (cx, cy, 0.6), (0, 0, 0.8),
-                (1.0, 1.0, 1.0, 1.0), ns=name + '_text',
+                (1.0, 1.0, 1.0, 1.0), ns=f'{name}_text',
                 frame_id=self.zone_frame, text=name))
         self._zone_pub.publish(arr)

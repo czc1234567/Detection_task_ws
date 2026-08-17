@@ -3,23 +3,11 @@
 """
 dog_ai_detection.parking_detection_node
 =======================================
-节点 1: 车辆违规停放检测 (行人作为测试类别).
-
-检测流程 (单模型一次推理):
-    yolo26n (COCO 80 类)
-      ├── parking 组: car/truck/bus/motorcycle -> 禁停区域多边形判定 -> 违规红框
-      └── pedestrian 组: person (测试用, 蓝框, 不判违规)
-
-话题 (标准消息, 无自定义消息):
-    订阅: /camera/color/image_raw, /camera/depth/image_raw, /camera/color/camera_info
-    发布: /detection/result_image, /detection/object_markers,
-          /detection/map_markers, /detection/alert, /detection/web_json
-
-启动: 见 dog_bringup/scripts/start_detection.sh
+节点 1: 车辆违规停放检测.
 """
 
 import rclpy
-
+from rclpy.executors import ExternalShutdownException
 from dog_ai_detection.detection_core import BaseVizDetectionNode
 
 
@@ -54,14 +42,15 @@ def main(args=None):
     node = ParkingDetectionNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        try:
-            rclpy.shutdown()
-        except Exception:  # noqa: BLE001
-            pass
+        if rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':
