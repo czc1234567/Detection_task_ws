@@ -3,7 +3,7 @@
 """
 dog_ai_detection.detection_core
 ===============================
-共享检测核心 (标准消息: MarkerArray / Image / Bool / String)
+共享检测核心 (标准消息: MarkerArray / CompressedImage / Bool / String)
 """
 
 import os
@@ -17,7 +17,7 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import CameraInfo, CompressedImage
 from std_msgs.msg import Bool, String
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point, PointStamped
@@ -79,7 +79,13 @@ class YoloDetector:
             self.last_error = 'ultralytics 需要 PyTorch: pip install ultralytics'
             return False
         try:
-            self._model = YOLO(self.model_path, task='detect')
+            model = YOLO(self.model_path, task='detect')
+            # 若是 engine 文件，强制做一次热身预测，若版本不匹配会直接报错
+            if self.model_path.endswith('.engine'):
+                dummy = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
+                model.predict(source=dummy, imgsz=self.imgsz, device=self.device or None, verbose=False)
+            
+            self._model = model
             names = getattr(self._model, 'names', None)
             if isinstance(names, dict):
                 self._names = {int(k): str(v) for k, v in names.items()}
@@ -291,10 +297,17 @@ class BaseVizDetectionNode(Node):
         self.declare_parameter('iou_threshold', 0.45)
         self.declare_parameter('marker_lifetime', 0.5)
         self.declare_parameter('embed_image_in_json', False)
+        
+        # --- UI与渲染控制参数 ---
         self.declare_parameter('show_gui', False)
         self.declare_parameter('gui_scale', 0.6)
-        self.declare_parameter('result_image_scale', 0.6)
+        
+        # 决定是否发布图像以及发布的格式
         self.declare_parameter('publish_image', True)
+        self.declare_parameter('result_image_topic', '/detection/result_image')
+        # 是否将 RViz 的三维标注阵列发布出去 (关掉可以极大省 CPU 和带宽)
+        self.declare_parameter('publish_rviz_markers', True) 
+        
         self.declare_parameter('inference_period_ms', 100)
         self.declare_parameter('sync_slop', 0.2)
         self.declare_parameter('depth_scale', 0.001)
@@ -319,7 +332,7 @@ class BaseVizDetectionNode(Node):
         self._frame_lock = threading.Lock()
         self._frame_seq = 0
         self._processed_seq = -1
-        self._encoder = ThreadPoolExecutor(max_workers=1)
+        self._encoder = ThreadPoolExecutor(max_workers=2) # 留2个线程防拥堵
         self._encode_busy = False
 
         self._tf_buffer = Buffer()
@@ -335,6 +348,7 @@ class BaseVizDetectionNode(Node):
         else:
             self.get_logger().error(f'Inference engine unavailable: {self._engine.last_error}')
 
+        from sensor_msgs.msg import Image
         self._cam_info_sub = self.create_subscription(CameraInfo, self.camera_info_topic, self._camera_info_cb, 10)
         self._color_sub = message_filters.Subscriber(self, Image, self.color_topic)
         self._depth_sub = message_filters.Subscriber(self, Image, self.depth_topic)
@@ -342,14 +356,20 @@ class BaseVizDetectionNode(Node):
             [self._color_sub, self._depth_sub], queue_size=2, slop=float(self.sync_slop))
         self._sync.registerCallback(self._image_sync_cb)
 
-        self._img_pub = self.create_publisher(Image, self.result_image_topic, 10)
-        self._marker_pub = self.create_publisher(MarkerArray, self.object_markers_topic, 10)
-        self._zone_pub = self.create_publisher(MarkerArray, self.zone_markers_topic, 10)
+        # 发布器
+        if self.publish_image:
+            # 高效网络传输，采用压缩图像格式发布
+            self._img_pub = self.create_publisher(CompressedImage, f"{self.result_image_topic}/compressed", 10)
+        
+        if self.publish_rviz_markers:
+            self._marker_pub = self.create_publisher(MarkerArray, self.object_markers_topic, 10)
+            self._zone_pub = self.create_publisher(MarkerArray, self.zone_markers_topic, 10)
+            self._zone_timer = self.create_timer(1.0, self._publish_zones)
+            
         self._alert_pub = self.create_publisher(Bool, self.alert_topic, 10)
         self._json_pub = self.create_publisher(String, self.web_json_topic, 10)
 
         self._timer = self.create_timer(self.inference_period_ms / 1000.0, self._process_tick)
-        self._zone_timer = self.create_timer(1.0, self._publish_zones)
 
         self.get_logger().info(f'[{self.get_name()}] started: color={self.color_topic}, depth={self.depth_topic}')
 
@@ -389,10 +409,12 @@ class BaseVizDetectionNode(Node):
         self.iou_threshold = float(self.get_parameter('iou_threshold').value)
         self.marker_lifetime = float(self.get_parameter('marker_lifetime').value)
         self.embed_image_in_json = bool(self.get_parameter('embed_image_in_json').value)
+        
         self.show_gui = bool(self.get_parameter('show_gui').value)
         self.gui_scale = float(self.get_parameter('gui_scale').value)
-        self.result_image_scale = float(self.get_parameter('result_image_scale').value)
         self.publish_image = bool(self.get_parameter('publish_image').value)
+        self.publish_rviz_markers = bool(self.get_parameter('publish_rviz_markers').value)
+        
         self.inference_period_ms = int(self.get_parameter('inference_period_ms').value)
         self.sync_slop = float(self.get_parameter('sync_slop').value)
         self.depth_scale = float(self.get_parameter('depth_scale').value)
@@ -520,43 +542,63 @@ class BaseVizDetectionNode(Node):
 
         raw_dets = self._engine.infer(frame)
         self._frame_dets = raw_dets
-        frame_tf = self._lookup_frame_tf()
+        
+        # 只在需要 3D 渲染或者需要判断地理区域时，才去查 TF 和计算 3D 坐标
+        frame_tf = None
+        needs_3d = self.publish_rviz_markers or any(g.get('zones') for g in self._groups)
+        if needs_3d:
+            frame_tf = self._lookup_frame_tf()
+            
         groups = {g['name']: [d for d in raw_dets if d['class_name'] in g['classes']] for g in self._groups}
 
         markers = MarkerArray()
         violations = []
         alert = False
 
+        # 如果需要发图或者发界面，绘制灰框底色
+        if self.publish_image or self.show_gui:
+            for det in raw_dets:
+                x1, y1, x2, y2 = [int(v) for v in det['bbox'][:4]]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (128, 128, 128), 1)
+                cv2.putText(frame, det['class_name'], (x1, max(y1 - 6, 12)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (128, 128, 128), 1)
+
         for gname, dets in groups.items():
             g = self._group_by_name(gname)
             for i, det in enumerate(dets):
                 x1, y1, x2, y2 = [int(v) for v in det['bbox'][:4]]
-
-                depth_m = self._depth_at_center(x1, y1, x2, y2, depth_mat, is_meters)
-                if depth_m is None or depth_m > self.max_depth:
-                    depth_m = None
-                mapp = None
-                if depth_m is not None and frame_tf is not None:
-                    cam = self._to_camera_3d(x1, y1, x2, y2, depth_m)
-                    mapp = self._transform_point_to_map(*cam, frame_tf)
-                mx, my, mz = mapp if mapp is not None else (None, None, None)
+                
+                mx, my, mz = None, None, None
+                depth_m = None
+                if needs_3d:
+                    depth_m = self._depth_at_center(x1, y1, x2, y2, depth_mat, is_meters)
+                    if depth_m is None or depth_m > self.max_depth:
+                        depth_m = None
+                    if depth_m is not None and frame_tf is not None:
+                        cam = self._to_camera_3d(x1, y1, x2, y2, depth_m)
+                        mapp = self._transform_point_to_map(*cam, frame_tf)
+                        if mapp:
+                            mx, my, mz = mapp
 
                 zone = self._check_violation(gname, det, mx, my)
                 is_violation = zone is not None
                 if is_violation:
                     alert = True
 
-                c = g['color_vio_bgr'] if is_violation else g['color_ok_bgr']
-                label = f"{det['class_name']} {float(det['score']):.2f}"
-                if depth_m is not None:
-                    label += f" {depth_m:.2f}m"
-                if zone:
-                    label += f" [{zone}]"
-                cv2.rectangle(frame, (x1, y1), (x2, y2), c, 2)
-                ty = y2 + 18 if y2 + 18 < frame.shape[0] else y1 - 6
-                cv2.putText(frame, label, (x1, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, c, 2)
+                # 绘制彩色告警框
+                if self.publish_image or self.show_gui:
+                    c = g['color_vio_bgr'] if is_violation else g['color_ok_bgr']
+                    label = f"{det['class_name']} {float(det['score']):.2f}"
+                    if depth_m is not None:
+                        label += f" {depth_m:.2f}m"
+                    if zone:
+                        label += f" [{zone}]"
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), c, 2)
+                    ty = y2 + 18 if y2 + 18 < frame.shape[0] else y1 - 6
+                    cv2.putText(frame, label, (x1, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, c, 2)
 
-                if mapp is not None:
+                # 添加 3D Marker
+                if self.publish_rviz_markers and mx is not None:
                     bw = (x2 - x1) * depth_m / self._fx
                     bh = (y2 - y1) * depth_m / self._fy
                     rgba = g['color_vio'] + (0.8,) if is_violation else g['color_ok'] + (0.7,)
@@ -571,24 +613,26 @@ class BaseVizDetectionNode(Node):
                         (1.0, 1.0, 1.0, 1.0), ns=f"{gname}_labels",
                         frame_id=self.map_frame, text=label))
 
+                # 汇总告警 JSON
                 if is_violation:
                     violations.append({
                         'class_name': det['class_name'],
                         'violation': zone,
                         'confidence': round(float(det['score']), 3),
-                        'position': {'x': round(mx, 3), 'y': round(my, 3), 'z': round(mz, 3)} if mapp is not None else None,
+                        'position': {'x': round(mx, 3), 'y': round(my, 3), 'z': round(mz, 3)} if mx is not None else None,
                     })
 
-        # 退出安全发布
         if not rclpy.ok():
             return
 
-        self._marker_pub.publish(markers)
+        if self.publish_rviz_markers:
+            self._marker_pub.publish(markers)
 
         if self.show_gui:
             self._show_gui(frame)
+            
         if self.publish_image:
-            self._img_pub.publish(self._to_image_msg(self._resize(frame, self.result_image_scale)))
+            self._publish_compressed_frame(frame)
 
         if alert:
             self._alert_pub.publish(Bool(data=True))
@@ -606,6 +650,20 @@ class BaseVizDetectionNode(Node):
                     self._encoder.submit(self._encode_and_publish, frame.copy(), payload)
             else:
                 self._json_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
+
+    def _publish_compressed_frame(self, frame):
+        """高效发布 JPEG 压缩图像 (替代原生巨量 Image 带宽)"""
+        if not rclpy.ok():
+            return
+        msg = CompressedImage()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.camera_frame
+        msg.format = "jpeg"
+        # 画面已标注，直接压缩 (质优75左右)
+        ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        if ok:
+            msg.data = buf.tobytes()
+            self._img_pub.publish(msg)
 
     @staticmethod
     def _resize(frame, scale):
@@ -639,19 +697,8 @@ class BaseVizDetectionNode(Node):
             self._encoder.shutdown(wait=False, cancel_futures=True)
         super().destroy_node()
 
-    def _to_image_msg(self, frame):
-        msg = Image()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = self.camera_frame
-        msg.height, msg.width = frame.shape[:2]
-        msg.encoding = 'bgr8'
-        msg.is_bigendian = 0
-        msg.step = frame.strides[0]
-        msg.data = frame.tobytes()
-        return msg
-
     def _publish_zones(self):
-        if not rclpy.ok():
+        if not rclpy.ok() or not self.publish_rviz_markers:
             return
         arr = MarkerArray()
         zones = [('parking', self.parking_zone, (0.0, 1.0, 0.0, 1.0)),

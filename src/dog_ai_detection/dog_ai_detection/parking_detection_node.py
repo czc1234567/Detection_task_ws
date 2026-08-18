@@ -18,7 +18,7 @@ class ParkingDetectionNode(BaseVizDetectionNode):
     MODEL_CANDIDATES = ('yolo26n.engine', 'yolo26n.pt')
 
     def _declare_task_params(self):
-        self.declare_parameter('result_image_topic', '/detection/result_image')
+        # 注意: 已经移除了对 result_image_topic 的重复声明
         self.declare_parameter('vehicle_classes', ['car', 'truck', 'bus', 'motorcycle'])
         self.declare_parameter('person_classes', ['person'])
 

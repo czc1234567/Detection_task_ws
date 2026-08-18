@@ -18,7 +18,7 @@ class HelmetVestDetectionNode(BaseVizDetectionNode):
     MODEL_CANDIDATES = ('helmet.engine', 'helmet.pt')
 
     def _declare_task_params(self):
-        self.declare_parameter('result_image_topic', '/detection/ppe_result_image')
+        # 注意: 已经移除了对 result_image_topic 的重复声明
         self.declare_parameter('ppe_classes', ['Helm', 'No_Helm', 'No_Vest', 'Vest'])
 
     def build_groups(self):
