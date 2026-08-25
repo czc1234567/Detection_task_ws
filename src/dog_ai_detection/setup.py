@@ -24,6 +24,8 @@ setup(
         'console_scripts': [
             'parking_detection_node = dog_ai_detection.parking_detection_node:main',
             'helmet_vest_detection_node = dog_ai_detection.helmet_vest_detection_node:main',
+            'fire_detection_node = dog_ai_detection.fire_detection_node:main',
+            'smoke_detection_node = dog_ai_detection.smoke_detection_node:main',
         ],
     },
 )

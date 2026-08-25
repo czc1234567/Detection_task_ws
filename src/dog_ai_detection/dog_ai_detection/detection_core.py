@@ -3,13 +3,16 @@
 """
 dog_ai_detection.detection_core
 ===============================
-共享检测核心 (标准消息: MarkerArray / CompressedImage / Bool / String)
+共享检测核心 (彻底修复参数未初始化异常、支持可选类别过滤、2D YOLO 目标多算法跟踪消抖、允许/禁区判定与前端 Web JSON 消息发布)
 """
 
 import os
 import threading
 import json
 import base64
+import math
+import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
@@ -17,7 +20,8 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
-from sensor_msgs.msg import CameraInfo, CompressedImage
+from rcl_interfaces.msg import SetParametersResult
+from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Bool, String
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point, PointStamped
@@ -25,21 +29,25 @@ from tf2_geometry_msgs import do_transform_point
 from tf2_ros import Buffer, TransformListener
 import message_filters
 
+# 引入 2D 目标跟踪消抖库
+from dog_ai_detection.yolo_tracker import build_tracker
+
 MODELS_DIR = os.path.join(os.path.dirname(__file__), 'models')
 
 
 class YoloDetector:
-    """多后端 YOLO 推理引擎."""
+    """多后端 YOLO 推理引擎 (支持 target_classes 动态过滤/缺省全部检测)."""
 
     def __init__(self, model_path: str, conf_threshold: float = 0.5,
                  iou_threshold: float = 0.45, class_names=None,
-                 device: str = '', imgsz: int = 640):
+                 device: str = '', imgsz: int = 640, target_classes=None):
         self.model_path = model_path
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         self.class_names = list(class_names or [])
         self.device = device
         self.imgsz = imgsz
+        self.target_classes = [str(c) for c in (target_classes or []) if str(c).strip()]
 
         self._backend = None
         self._names = {i: n for i, n in enumerate(self.class_names)}
@@ -71,7 +79,6 @@ class YoloDetector:
             ok = self._try_ultralytics()
         return ok
 
-    # ============================ ultralytics ============================
     def _try_ultralytics(self) -> bool:
         try:
             from ultralytics import YOLO
@@ -80,7 +87,6 @@ class YoloDetector:
             return False
         try:
             model = YOLO(self.model_path, task='detect')
-            # 若是 engine 文件，强制做一次热身预测，若版本不匹配会直接报错
             if self.model_path.endswith('.engine'):
                 dummy = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
                 model.predict(source=dummy, imgsz=self.imgsz, device=self.device or None, verbose=False)
@@ -96,8 +102,10 @@ class YoloDetector:
             return False
 
     def _infer_ultralytics(self, bgr):
+        target_ids = self._resolve_target_ids()
         results = self._model.predict(
             source=bgr, conf=self.conf_threshold, iou=self.iou_threshold,
+            classes=target_ids if target_ids else None,
             imgsz=self.imgsz, device=self.device or None, verbose=False)
         dets = []
         if not results:
@@ -107,14 +115,15 @@ class YoloDetector:
             return dets
         for i in range(len(boxes)):
             cls_id = int(boxes.cls[i].item())
+            cls_name = self._names.get(cls_id, str(cls_id))
             dets.append({
-                'class_name': self._names.get(cls_id, str(cls_id)),
+                'class_name': cls_name,
+                'class_id': cls_id,
                 'score': float(boxes.conf[i].item()),
                 'bbox': [float(v) for v in boxes.xyxy[i].tolist()],
             })
         return dets
 
-    # ============================= TensorRT =============================
     def _try_tensorrt(self) -> bool:
         try:
             import tensorrt as trt
@@ -178,7 +187,6 @@ class YoloDetector:
             self._cuda_ctx.pop()
         return self._decode_yolo_output(out, ratio, dw, dh, bgr.shape)
 
-    # =========================== onnxruntime ============================
     def _try_onnxruntime(self) -> bool:
         try:
             import onnxruntime as ort
@@ -220,6 +228,21 @@ class YoloDetector:
         canvas[dh:dh + nh, dw:dw + nw] = resized
         return canvas, r, (dw, dh)
 
+    def _resolve_target_ids(self):
+        if not self.target_classes:
+            return None
+        ids = []
+        for tc in self.target_classes:
+            if not tc:
+                continue
+            if isinstance(tc, int) or (isinstance(tc, str) and tc.isdigit()):
+                ids.append(int(tc))
+            else:
+                for k, v in self._names.items():
+                    if str(v).lower() == str(tc).lower():
+                        ids.append(k)
+        return list(set(ids)) if ids else None
+
     def _decode_yolo_output(self, out, ratio, dw, dh, orig_shape):
         dets = []
         if out.ndim == 3:
@@ -239,6 +262,13 @@ class YoloDetector:
         if len(conf) == 0:
             return dets
 
+        target_ids = self._resolve_target_ids()
+        if target_ids is not None:
+            mask = np.isin(cls, target_ids)
+            boxes, conf, cls = boxes[mask], conf[mask], cls[mask]
+            if len(conf) == 0:
+                return dets
+
         xyxy = np.empty_like(boxes)
         xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2.0
         xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2.0
@@ -254,8 +284,10 @@ class YoloDetector:
                                    self.conf_threshold, self.iou_threshold)
         for idx in (indices.flatten() if len(indices) else []):
             cls_id = int(cls[idx])
+            cls_name = self._names.get(cls_id, str(cls_id))
             dets.append({
-                'class_name': self._names.get(cls_id, str(cls_id)),
+                'class_name': cls_name,
+                'class_id': cls_id,
                 'score': float(conf[idx]),
                 'bbox': [float(v) for v in xyxy[idx]],
             })
@@ -272,7 +304,7 @@ class YoloDetector:
 
 
 class BaseVizDetectionNode(Node):
-    """可视化检测节点基类."""
+    """支持 2D YOLO 目标跟踪消抖、允许/禁区判定与前端 Web JSON 消息发布的检测基类."""
 
     TASK_NODE_NAME = 'detection_node'
     MODEL_CANDIDATES = ('yolo26n.engine', 'yolo26n.pt')
@@ -281,6 +313,7 @@ class BaseVizDetectionNode(Node):
         super().__init__(self.TASK_NODE_NAME)
 
         self._declare_task_params()
+        self.declare_parameter('map_name', 'default_map')
         self.declare_parameter('color_topic', '/camera/color/image_raw')
         self.declare_parameter('depth_topic', '/camera/depth/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/color/camera_info')
@@ -289,66 +322,83 @@ class BaseVizDetectionNode(Node):
         self.declare_parameter('alert_topic', '/detection/alert')
         self.declare_parameter('web_json_topic', '/detection/web_json')
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
+        self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('zone_frame', 'map')
         self.declare_parameter('model_path', '')
-        self.declare_parameter('class_names', [])
+
+        # 使用带字符串原型的默认值，既定义 STRING_ARRAY 类型又赋予初始空列表，解决所有类型报错
+        self.declare_parameter('class_names', [''])
+        self.declare_parameter('target_classes', [''])
+
         self.declare_parameter('conf_threshold', 0.5)
         self.declare_parameter('iou_threshold', 0.45)
         self.declare_parameter('marker_lifetime', 0.5)
         self.declare_parameter('embed_image_in_json', False)
         
-        # --- UI与渲染控制参数 ---
         self.declare_parameter('show_gui', False)
         self.declare_parameter('gui_scale', 0.6)
+        self.declare_parameter('publish_rviz_markers', True)
         
-        # 决定是否发布图像以及发布的格式
-        self.declare_parameter('publish_image', True)
-        self.declare_parameter('result_image_topic', '/detection/result_image')
-        # 是否将 RViz 的三维标注阵列发布出去 (关掉可以极大省 CPU 和带宽)
-        self.declare_parameter('publish_rviz_markers', True) 
+        self.declare_parameter('log_fps', True)
+        self.declare_parameter('fps_log_interval_sec', 1.0)
         
         self.declare_parameter('inference_period_ms', 100)
         self.declare_parameter('sync_slop', 0.2)
         self.declare_parameter('depth_scale', 0.001)
         self.declare_parameter('max_depth', 8.0)
-        self.declare_parameter('parking_zone', [])
-        self.declare_parameter('fire_lane_zone', [])
+        self.declare_parameter('zones_json', '{}')
+
+        self.declare_parameter('tracker_type', 'bytetrack')
+        self.declare_parameter('min_consecutive_frames', 15)
+        self.declare_parameter('max_miss_frames', 5)
 
         self._load_params()
         self.model_path = self._resolve_model(self.get_parameter('model_path').value)
         self._groups = self.build_groups()
-        if not self._groups:
-            self.get_logger().warn('任务组为空, 不会输出任何检测结果')
 
         self._bridge = CvBridge()
         self._color = None
         self._depth = None
         self._depth_is_meters = False
         self._header = None
-        self._frame_dets = []
         self._fx = self._fy = self._cx = self._cy = None
         
         self._frame_lock = threading.Lock()
         self._frame_seq = 0
         self._processed_seq = -1
-        self._encoder = ThreadPoolExecutor(max_workers=2) # 留2个线程防拥堵
+        self._encoder = ThreadPoolExecutor(max_workers=2)
         self._encode_busy = False
+
+        self._fps_timestamps = deque(maxlen=60)
+        self._fps_durations = deque(maxlen=60)
+        self._last_fps_log_time = time.time()
+        self._current_fps = 0.0
 
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
+
+        # 实例化 2D 目标跟踪器
+        self._tracker = build_tracker(
+            tracker_type=self.tracker_type,
+            min_hits=self.min_consecutive_frames,
+            max_miss=self.max_miss_frames
+        )
+
+        self.add_on_set_parameters_callback(self._on_params_changed)
 
         self._engine = YoloDetector(
             model_path=self.model_path,
             conf_threshold=self.conf_threshold,
             iou_threshold=self.iou_threshold,
-            class_names=self.class_names)
+            class_names=self.class_names,
+            target_classes=self.target_classes)
         if self._engine.load():
-            self.get_logger().info(f'Model loaded (backend={self._engine._backend}): {self.model_path}')
+            mode_desc = f"Filter Classes: {self.target_classes}" if self.target_classes else "Detect All Classes (Default)"
+            self.get_logger().info(f'Model loaded ({self._engine._backend}): {self.model_path} | {mode_desc}')
         else:
             self.get_logger().error(f'Inference engine unavailable: {self._engine.last_error}')
 
-        from sensor_msgs.msg import Image
         self._cam_info_sub = self.create_subscription(CameraInfo, self.camera_info_topic, self._camera_info_cb, 10)
         self._color_sub = message_filters.Subscriber(self, Image, self.color_topic)
         self._depth_sub = message_filters.Subscriber(self, Image, self.depth_topic)
@@ -356,11 +406,6 @@ class BaseVizDetectionNode(Node):
             [self._color_sub, self._depth_sub], queue_size=2, slop=float(self.sync_slop))
         self._sync.registerCallback(self._image_sync_cb)
 
-        # 发布器
-        if self.publish_image:
-            # 高效网络传输，采用压缩图像格式发布
-            self._img_pub = self.create_publisher(CompressedImage, f"{self.result_image_topic}/compressed", 10)
-        
         if self.publish_rviz_markers:
             self._marker_pub = self.create_publisher(MarkerArray, self.object_markers_topic, 10)
             self._zone_pub = self.create_publisher(MarkerArray, self.zone_markers_topic, 10)
@@ -370,8 +415,7 @@ class BaseVizDetectionNode(Node):
         self._json_pub = self.create_publisher(String, self.web_json_topic, 10)
 
         self._timer = self.create_timer(self.inference_period_ms / 1000.0, self._process_tick)
-
-        self.get_logger().info(f'[{self.get_name()}] started: color={self.color_topic}, depth={self.depth_topic}')
+        self.get_logger().info(f'[{self.get_name()}] Started on map: {self.map_name}')
 
     def _declare_task_params(self):
         pass
@@ -379,20 +423,47 @@ class BaseVizDetectionNode(Node):
     def build_groups(self) -> list:
         return []
 
-    def _check_violation(self, gname, det, mx, my):
-        g = self._group_by_name(gname)
-        if g is None:
-            return None
-        if g.get('violation_classes') and det['class_name'] in g['violation_classes']:
-            return det['class_name']
-        if g.get('zones') and mx is not None:
-            return self._check_zones(mx, my)
-        return None
+    def _on_params_changed(self, params):
+        for param in params:
+            if param.name == 'zones_json':
+                try:
+                    self._parse_zones(param.value)
+                    self.get_logger().info('违规区域已通过参数接口动态热更新！')
+                except Exception as e:
+                    return SetParametersResult(successful=False, reason=str(e))
+            elif param.name == 'map_name':
+                self.map_name = str(param.value)
+            elif param.name == 'target_classes':
+                raw = list(param.value) if param.value else []
+                self.target_classes = [str(c) for c in raw if str(c).strip()]
+                self._engine.target_classes = self.target_classes
+                self.get_logger().info(f'目标过滤类别已热更新: {self.target_classes or "全部检测"}')
+            elif param.name == 'log_fps':
+                self.log_fps = bool(param.value)
+            elif param.name == 'fps_log_interval_sec':
+                self.fps_log_interval_sec = float(param.value)
+        return SetParametersResult(successful=True)
 
-    def _group_by_name(self, gname):
-        return next((g for g in self._groups if g['name'] == gname), None)
+    def _parse_zones(self, zones_json_str: str):
+        self.zones_dict = {}
+        try:
+            raw = json.loads(zones_json_str) if isinstance(zones_json_str, str) else zones_json_str
+            for zname, zcfg in raw.items():
+                poly = [tuple(p) for p in zcfg.get('polygon', [])]
+                if len(poly) >= 3:
+                    self.zones_dict[zname] = {
+                        'polygon': poly,
+                        'np_poly': np.array(poly, dtype=np.float32),
+                        'classes': zcfg.get('classes', []),
+                        'zone_type': zcfg.get('zone_type', 'forbidden'),
+                        'violation_name': zcfg.get('violation_name', zname),
+                        'color': tuple(zcfg.get('color', [1.0, 0.0, 0.0, 1.0]))
+                    }
+        except Exception as e:
+            self.get_logger().warn(f'解析区域配置错误: {e}')
 
     def _load_params(self):
+        self.map_name = str(self.get_parameter('map_name').value)
         self.color_topic = self.get_parameter('color_topic').value
         self.depth_topic = self.get_parameter('depth_topic').value
         self.camera_info_topic = self.get_parameter('camera_info_topic').value
@@ -400,11 +471,24 @@ class BaseVizDetectionNode(Node):
         self.zone_markers_topic = self.get_parameter('zone_markers_topic').value
         self.alert_topic = self.get_parameter('alert_topic').value
         self.web_json_topic = self.get_parameter('web_json_topic').value
-        self.result_image_topic = self.get_parameter('result_image_topic').value
         self.camera_frame = self.get_parameter('camera_frame').value
+        self.base_frame = self.get_parameter('base_frame').value
         self.map_frame = self.get_parameter('map_frame').value
         self.zone_frame = self.get_parameter('zone_frame').value
-        self.class_names = list(self.get_parameter('class_names').value)
+        
+        # 安全取值，过滤空字符串占位符
+        try:
+            raw_c = self.get_parameter('class_names').value
+            self.class_names = [str(c) for c in (list(raw_c) if raw_c else []) if str(c).strip()]
+        except Exception:
+            self.class_names = []
+
+        try:
+            raw_t = self.get_parameter('target_classes').value
+            self.target_classes = [str(c) for c in (list(raw_t) if raw_t else []) if str(c).strip()]
+        except Exception:
+            self.target_classes = []
+
         self.conf_threshold = float(self.get_parameter('conf_threshold').value)
         self.iou_threshold = float(self.get_parameter('iou_threshold').value)
         self.marker_lifetime = float(self.get_parameter('marker_lifetime').value)
@@ -412,21 +496,21 @@ class BaseVizDetectionNode(Node):
         
         self.show_gui = bool(self.get_parameter('show_gui').value)
         self.gui_scale = float(self.get_parameter('gui_scale').value)
-        self.publish_image = bool(self.get_parameter('publish_image').value)
         self.publish_rviz_markers = bool(self.get_parameter('publish_rviz_markers').value)
+        
+        self.log_fps = bool(self.get_parameter('log_fps').value)
+        self.fps_log_interval_sec = float(self.get_parameter('fps_log_interval_sec').value)
         
         self.inference_period_ms = int(self.get_parameter('inference_period_ms').value)
         self.sync_slop = float(self.get_parameter('sync_slop').value)
         self.depth_scale = float(self.get_parameter('depth_scale').value)
         self.max_depth = float(self.get_parameter('max_depth').value)
 
-        parking_flat = list(self.get_parameter('parking_zone').value)
-        fire_flat = list(self.get_parameter('fire_lane_zone').value)
-        self.parking_zone = [tuple(parking_flat[i:i + 2]) for i in range(0, len(parking_flat) - 1, 2)]
-        self.fire_lane_zone = [tuple(fire_flat[i:i + 2]) for i in range(0, len(fire_flat) - 1, 2)]
-        
-        self.parking_zone_np = np.array(self.parking_zone, dtype=np.float32) if len(self.parking_zone) >= 3 else None
-        self.fire_lane_zone_np = np.array(self.fire_lane_zone, dtype=np.float32) if len(self.fire_lane_zone) >= 3 else None
+        self.tracker_type = str(self.get_parameter('tracker_type').value)
+        self.min_consecutive_frames = int(self.get_parameter('min_consecutive_frames').value)
+        self.max_miss_frames = int(self.get_parameter('max_miss_frames').value)
+
+        self._parse_zones(self.get_parameter('zones_json').value)
 
     def _resolve_model(self, value: str) -> str:
         if value:
@@ -434,15 +518,12 @@ class BaseVizDetectionNode(Node):
         for name in self.MODEL_CANDIDATES:
             p = os.path.join(MODELS_DIR, name)
             if os.path.isfile(p):
-                if name != self.MODEL_CANDIDATES[0]:
-                    self.get_logger().warn(f'未找到首选模型 {self.MODEL_CANDIDATES[0]}, 回退使用 {name}')
                 return p
         return os.path.join(MODELS_DIR, self.MODEL_CANDIDATES[0])
 
     def _camera_info_cb(self, msg):
         self._fx, self._fy = float(msg.k[0]), float(msg.k[4])
         self._cx, self._cy = float(msg.k[2]), float(msg.k[5])
-        self.get_logger().info(f'Intrinsics: fx={self._fx:.2f} fy={self._fy:.2f} cx={self._cx:.2f} cy={self._cy:.2f}', once=True)
 
     def _image_sync_cb(self, color_msg, depth_msg):
         try:
@@ -484,14 +565,6 @@ class BaseVizDetectionNode(Node):
             m.text = text
         return m
 
-    def _check_zones(self, x, y):
-        pt = (float(x), float(y))
-        if self.parking_zone_np is not None and cv2.pointPolygonTest(self.parking_zone_np, pt, False) >= 0:
-            return 'illegal_parking'
-        if self.fire_lane_zone_np is not None and cv2.pointPolygonTest(self.fire_lane_zone_np, pt, False) >= 0:
-            return 'fire_lane_occupation'
-        return None
-
     def _depth_at_center(self, x1, y1, x2, y2, depth_mat, is_meters):
         if depth_mat is None:
             return None
@@ -511,13 +584,12 @@ class BaseVizDetectionNode(Node):
                 (v - self._cy) * depth_m / self._fy,
                 depth_m)
 
-    def _lookup_frame_tf(self):
+    def _lookup_frame_tf(self, target_frame, source_frame):
         import rclpy.time
         try:
             return self._tf_buffer.lookup_transform(
-                self.map_frame, self.camera_frame, rclpy.time.Time())
-        except Exception as exc:
-            self.get_logger().warn(f'TF {self.camera_frame}->{self.map_frame} failed: {exc}', throttle_duration_sec=5.0)
+                target_frame, source_frame, rclpy.time.Time())
+        except Exception:
             return None
 
     def _transform_point_to_map(self, px, py, pz, frame_tf):
@@ -528,9 +600,47 @@ class BaseVizDetectionNode(Node):
         out = do_transform_point(pt, frame_tf)
         return out.point.x, out.point.y, out.point.z
 
+    def _get_robot_pose(self):
+        tf_robot = self._lookup_frame_tf(self.map_frame, self.base_frame)
+        if tf_robot is None:
+            return None
+        t = tf_robot.transform.translation
+        r = tf_robot.transform.rotation
+        siny_cosp = 2 * (r.w * r.z + r.x * r.y)
+        cosy_cosp = 1 - 2 * (r.y * r.y + r.z * r.z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        return {'x': round(t.x, 3), 'y': round(t.y, 3), 'yaw': round(yaw, 3)}
+
+    def _evaluate_detection_violation(self, det, mx=None, my=None):
+        cls_name = det['class_name']
+        for g in self._groups:
+            if cls_name not in g['classes']:
+                continue
+
+            if g.get('violation_classes') and cls_name in g['violation_classes']:
+                return True, cls_name
+
+            if g.get('zones') and mx is not None:
+                pt = (float(mx), float(my))
+                for zname, zcfg in self.zones_dict.items():
+                    if not zcfg['classes'] or cls_name in zcfg['classes']:
+                        inside = (cv2.pointPolygonTest(zcfg['np_poly'], pt, False) >= 0)
+                        zone_type = zcfg.get('zone_type', 'forbidden')
+
+                        if zone_type == 'allowed':
+                            if not inside:
+                                return True, zcfg['violation_name']
+                        elif zone_type == 'forbidden':
+                            if inside:
+                                return True, zcfg['violation_name']
+
+        return False, None
+
     def _process_tick(self):
         if not rclpy.ok() or self._fx is None:
             return
+
+        tick_start = time.time()
 
         with self._frame_lock:
             if self._color is None or self._frame_seq == self._processed_seq:
@@ -541,129 +651,141 @@ class BaseVizDetectionNode(Node):
             self._processed_seq = self._frame_seq
 
         raw_dets = self._engine.infer(frame)
-        self._frame_dets = raw_dets
-        
-        # 只在需要 3D 渲染或者需要判断地理区域时，才去查 TF 和计算 3D 坐标
-        frame_tf = None
-        needs_3d = self.publish_rviz_markers or any(g.get('zones') for g in self._groups)
-        if needs_3d:
-            frame_tf = self._lookup_frame_tf()
-            
-        groups = {g['name']: [d for d in raw_dets if d['class_name'] in g['classes']] for g in self._groups}
+        frame_tf = self._lookup_frame_tf(self.map_frame, self.camera_frame)
+
+        # 1. 预先计算所有检测框的空间 3D 坐标
+        det_map_pos = {}
+        for i, det in enumerate(raw_dets):
+            x1, y1, x2, y2 = [int(v) for v in det['bbox'][:4]]
+            depth_m = self._depth_at_center(x1, y1, x2, y2, depth_mat, is_meters)
+            if depth_m is not None and frame_tf is not None:
+                cam = self._to_camera_3d(x1, y1, x2, y2, depth_m)
+                mapp = self._transform_point_to_map(*cam, frame_tf)
+                if mapp:
+                    det_map_pos[i] = mapp
+
+        # 2. 方案 A：构造闭包评估函数供 Tracker 内部调用
+        def violation_eval_fn(det_item):
+            idx = raw_dets.index(det_item) if det_item in raw_dets else -1
+            mx, my = (det_map_pos[idx][0], det_map_pos[idx][1]) if idx in det_map_pos else (None, None)
+            return self._evaluate_detection_violation(det_item, mx, my)
+
+        # 3. 传入 raw_dets 与 violation_eval_fn
+        active_tracks, confirmed_violations = self._tracker.step(raw_dets, violation_eval_fn)
 
         markers = MarkerArray()
-        violations = []
-        alert = False
+        frontend_objects = []
 
-        # 如果需要发图或者发界面，绘制灰框底色
-        if self.publish_image or self.show_gui:
-            for det in raw_dets:
-                x1, y1, x2, y2 = [int(v) for v in det['bbox'][:4]]
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (128, 128, 128), 1)
-                cv2.putText(frame, det['class_name'], (x1, max(y1 - 6, 12)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (128, 128, 128), 1)
+        for trk in active_tracks:
+            x1, y1, x2, y2 = [int(v) for v in trk.kf.get_state()]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
 
-        for gname, dets in groups.items():
-            g = self._group_by_name(gname)
-            for i, det in enumerate(dets):
-                x1, y1, x2, y2 = [int(v) for v in det['bbox'][:4]]
-                
-                mx, my, mz = None, None, None
-                depth_m = None
-                if needs_3d:
-                    depth_m = self._depth_at_center(x1, y1, x2, y2, depth_mat, is_meters)
-                    if depth_m is None or depth_m > self.max_depth:
-                        depth_m = None
-                    if depth_m is not None and frame_tf is not None:
-                        cam = self._to_camera_3d(x1, y1, x2, y2, depth_m)
-                        mapp = self._transform_point_to_map(*cam, frame_tf)
-                        if mapp:
-                            mx, my, mz = mapp
+            # 获取匹配到的 3D 坐标
+            depth_m = self._depth_at_center(x1, y1, x2, y2, depth_mat, is_meters)
+            mx, my, mz = None, None, None
+            if depth_m is not None and frame_tf is not None:
+                cam = self._to_camera_3d(x1, y1, x2, y2, depth_m)
+                mapp = self._transform_point_to_map(*cam, frame_tf)
+                if mapp:
+                    mx, my, mz = mapp
 
-                zone = self._check_violation(gname, det, mx, my)
-                is_violation = zone is not None
-                if is_violation:
-                    alert = True
+            is_confirmed = trk.is_confirmed_violation
+            hits = trk.violation_consecutive_hits
 
-                # 绘制彩色告警框
-                if self.publish_image or self.show_gui:
-                    c = g['color_vio_bgr'] if is_violation else g['color_ok_bgr']
-                    label = f"{det['class_name']} {float(det['score']):.2f}"
-                    if depth_m is not None:
-                        label += f" {depth_m:.2f}m"
-                    if zone:
-                        label += f" [{zone}]"
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), c, 2)
-                    ty = y2 + 18 if y2 + 18 < frame.shape[0] else y1 - 6
-                    cv2.putText(frame, label, (x1, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, c, 2)
+            obj_data = {
+                'track_id': trk.track_id,
+                'class_name': trk.class_name,
+                'confidence': round(trk.score, 3),
+                'bbox_2d': [x1, y1, x2, y2],
+                'map_position': {
+                    'x': round(mx, 3),
+                    'y': round(my, 3),
+                    'z': round(mz, 3)
+                } if mx is not None else None,
+                'distance_to_dog': round(depth_m, 2) if depth_m is not None else None,
+                'violation_info': {
+                    'is_violation': is_confirmed,
+                    'violation_type': trk.current_violation_type,
+                    'consecutive_hits': hits,
+                    'min_consecutive_frames': self.min_consecutive_frames,
+                    'status': 'confirmed' if is_confirmed else ('buffering' if hits > 0 else 'normal')
+                }
+            }
+            frontend_objects.append(obj_data)
 
-                # 添加 3D Marker
-                if self.publish_rviz_markers and mx is not None:
-                    bw = (x2 - x1) * depth_m / self._fx
-                    bh = (y2 - y1) * depth_m / self._fy
-                    rgba = g['color_vio'] + (0.8,) if is_violation else g['color_ok'] + (0.7,)
-                    base = g['offset'] + i * 2
-                    markers.markers.append(self._create_marker(
-                        Marker.CUBE, base, (mx, my, depth_m / 2.0),
-                        (max(bw, 0.2), max(bh, 0.2), 0.2), rgba,
-                        ns=f"{gname}_objects", frame_id=self.map_frame))
-                    markers.markers.append(self._create_marker(
-                        Marker.TEXT_VIEW_FACING, base + 1,
-                        (mx, my, depth_m / 2.0 + 0.35), (0, 0, 0.35),
-                        (1.0, 1.0, 1.0, 1.0), ns=f"{gname}_labels",
-                        frame_id=self.map_frame, text=label))
+            if self.show_gui:
+                color = (0, 0, 255) if is_confirmed else (0, 165, 255)
+                label = f"ID:{trk.track_id} {trk.class_name} [{hits}/{self.min_consecutive_frames}]"
+                if depth_m is not None:
+                    label += f" {depth_m:.1f}m"
+                if trk.current_violation_type:
+                    label += f" ({trk.current_violation_type})"
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                ty = max(y1 - 6, 12)
+                cv2.putText(frame, label, (x1, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
 
-                # 汇总告警 JSON
-                if is_violation:
-                    violations.append({
-                        'class_name': det['class_name'],
-                        'violation': zone,
-                        'confidence': round(float(det['score']), 3),
-                        'position': {'x': round(mx, 3), 'y': round(my, 3), 'z': round(mz, 3)} if mx is not None else None,
-                    })
-
-        if not rclpy.ok():
-            return
+            if self.publish_rviz_markers and mx is not None:
+                bw = (x2 - x1) * depth_m / self._fx
+                bh = (y2 - y1) * depth_m / self._fy
+                rgba = (1.0, 0.0, 0.0, 0.8) if is_confirmed else (1.0, 0.65, 0.0, 0.7)
+                markers.markers.append(self._create_marker(
+                    Marker.CUBE, trk.track_id * 2, (mx, my, depth_m / 2.0),
+                    (max(bw, 0.2), max(bh, 0.2), 0.2), rgba,
+                    ns=f"{self.get_name()}_objs", frame_id=self.map_frame))
+                markers.markers.append(self._create_marker(
+                    Marker.TEXT_VIEW_FACING, trk.track_id * 2 + 1,
+                    (mx, my, depth_m / 2.0 + 0.35), (0, 0, 0.35),
+                    (1.0, 1.0, 1.0, 1.0), ns=f"{self.get_name()}_lbls",
+                    frame_id=self.map_frame, text=f"ID:{trk.track_id} {trk.class_name}"))
 
         if self.publish_rviz_markers:
             self._marker_pub.publish(markers)
 
+        now = time.time()
+        duration_ms = (now - tick_start) * 1000.0
+        self._fps_timestamps.append(now)
+        self._fps_durations.append(duration_ms)
+
+        if len(self._fps_timestamps) > 1:
+            time_diff = self._fps_timestamps[-1] - self._fps_timestamps[0]
+            if time_diff > 0:
+                self._current_fps = (len(self._fps_timestamps) - 1) / time_diff
+
+        if self.log_fps and (now - self._last_fps_log_time >= self.fps_log_interval_sec):
+            avg_cost = np.mean(self._fps_durations) if self._fps_durations else 0.0
+            self.get_logger().info(
+                f"[PERF] FPS: {self._current_fps:.1f} | Latency: {avg_cost:.1f}ms | Tracked: {len(active_tracks)}"
+            )
+            self._last_fps_log_time = now
+
         if self.show_gui:
+            fps_text = f"FPS: {self._current_fps:.1f}"
+            cv2.putText(frame, fps_text, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             self._show_gui(frame)
-            
-        if self.publish_image:
-            self._publish_compressed_frame(frame)
 
-        if alert:
+        if len(confirmed_violations) > 0:
             self._alert_pub.publish(Bool(data=True))
-            self.get_logger().warn(f'{len(violations)} violation(s) detected')
 
-        if violations:
-            payload = {
-                'type': 'violations',
-                'timestamp': int(self.get_clock().now().nanoseconds / 1e9),
-                'violations': violations,
-            }
-            if self.embed_image_in_json:
-                if not self._encode_busy:
-                    self._encode_busy = True
-                    self._encoder.submit(self._encode_and_publish, frame.copy(), payload)
-            else:
-                self._json_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
+        robot_pose = self._get_robot_pose()
+        payload = {
+            'map_name': self.map_name,
+            'node': self.get_name(),
+            'timestamp': int(self.get_clock().now().nanoseconds / 1e9),
+            'robot_pose': robot_pose,
+            'summary': {
+                'total_tracked': len(frontend_objects),
+                'confirmed_violations_count': len(confirmed_violations),
+            },
+            'detections': frontend_objects
+        }
 
-    def _publish_compressed_frame(self, frame):
-        """高效发布 JPEG 压缩图像 (替代原生巨量 Image 带宽)"""
-        if not rclpy.ok():
-            return
-        msg = CompressedImage()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = self.camera_frame
-        msg.format = "jpeg"
-        # 画面已标注，直接压缩 (质优75左右)
-        ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-        if ok:
-            msg.data = buf.tobytes()
-            self._img_pub.publish(msg)
+        if self.embed_image_in_json:
+            if not self._encode_busy:
+                self._encode_busy = True
+                self._encoder.submit(self._encode_and_publish, frame.copy(), payload)
+        else:
+            self._json_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
 
     @staticmethod
     def _resize(frame, scale):
@@ -701,15 +823,14 @@ class BaseVizDetectionNode(Node):
         if not rclpy.ok() or not self.publish_rviz_markers:
             return
         arr = MarkerArray()
-        zones = [('parking', self.parking_zone, (0.0, 1.0, 0.0, 1.0)),
-                 ('fire_lane', self.fire_lane_zone, (1.0, 0.6, 0.0, 1.0))]
-        for name, poly, color in zones:
-            if len(poly) < 3:
-                continue
-            mid = len(arr.markers)
+        idx = 0
+        for zname, zcfg in self.zones_dict.items():
+            poly = zcfg['polygon']
+            color = zcfg['color']
+            mid = idx * 2
             line = self._create_marker(
                 Marker.LINE_STRIP, mid, (0, 0, 0), (0.15, 0, 0), color,
-                ns=name, frame_id=self.zone_frame)
+                ns=f"{self.get_name()}_{zname}", frame_id=self.zone_frame)
             for p in poly:
                 line.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.05))
             line.points.append(line.points[0])
@@ -717,7 +838,9 @@ class BaseVizDetectionNode(Node):
             cx = sum(p[0] for p in poly) / len(poly)
             cy = sum(p[1] for p in poly) / len(poly)
             arr.markers.append(self._create_marker(
-                Marker.TEXT_VIEW_FACING, mid + 100, (cx, cy, 0.6), (0, 0, 0.8),
-                (1.0, 1.0, 1.0, 1.0), ns=f'{name}_text',
-                frame_id=self.zone_frame, text=name))
-        self._zone_pub.publish(arr)
+                Marker.TEXT_VIEW_FACING, mid + 1, (cx, cy, 0.6), (0, 0, 0.8),
+                (1.0, 1.0, 1.0, 1.0), ns=f"{self.get_name()}_{zname}_text",
+                frame_id=self.zone_frame, text=zname))
+            idx += 1
+        if arr.markers:
+            self._zone_pub.publish(arr)

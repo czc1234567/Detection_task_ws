@@ -1,0 +1,35 @@
+{
+  "map_name": "factory_floor_1",
+  "node": "parking_detection_node",
+  "timestamp": 1771234567,
+  "robot_pose": {
+    "x": 2.451,
+    "y": 3.108,
+    "yaw": 0.354
+  },
+  "summary": {
+    "total_tracked": 1,
+    "confirmed_violations_count": 1
+  },
+  "detections": [
+    {
+      "track_id": 3,
+      "class_name": "car",
+      "confidence": 0.895,
+      "bbox_2d": [120, 180, 420, 360],
+      "map_position": {
+        "x": 3.52,
+        "y": 4.15,
+        "z": 0.12
+      },
+      "distance_to_dog": 2.45,
+      "violation_info": {
+        "is_violation": true,
+        "violation_type": "illegal_parking",
+        "consecutive_hits": 15,
+        "min_consecutive_frames": 15,
+        "status": "confirmed"
+      }
+    }
+  ]
+}

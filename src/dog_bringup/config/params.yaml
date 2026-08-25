@@ -1,80 +1,200 @@
 # =====================================================================
-# 巡检检测系统集中参数 (dog_bringup/config/params.yaml)
-# 全部使用标准消息, 无自定义消息
-# =====================================================================
-#
-# 奥比中光 Gemini 335L (orbbec_camera) 话题:
-#   彩色图:   /camera/color/image_raw        (1280x800 rgb8)
-#   深度图:   /camera/depth/image_raw        (1280x800 16UC1, mm)
-#   相机内参: /camera/color/camera_info
-#   坐标系:   camera_color_optical_frame (驱动发布 camera_link 为父系)
-#
-# 模型 (随 dog_ai_detection 包安装到 models/):
-#   yolo26n.engine/pt   COCO 80 类 (车辆/行人)
-#   helmet.pt           PPE: Helm/No_Helm/No_Vest/Vest
-#   model_path 留空 "" 表示使用包内默认模型; 也可填绝对路径
-#
-# 注意: rclpy 不支持 YAML 空数组 (会报参数未初始化), 空值请直接省略
+# 巡检检测系统集中参数配置
+# 支持: 地图配置、target_classes 类别过滤(可选)、2D 目标跟踪消抖、FPS 输出与区域配置
 # =====================================================================
 
-# ------------------- 节点 1: 车辆违规停放 + 行人(测试) -----------------
+# ------------------- 节点 1: 车辆违规停放 + 行人 -----------------------
 parking_detection_node:
   ros__parameters:
+    map_name: "factory_floor_1"
     color_topic: "/camera/color/image_raw"
     depth_topic: "/camera/depth/image_raw"
     camera_info_topic: "/camera/color/camera_info"
-    result_image_topic: "/detection/result_image"
     object_markers_topic: "/detection/object_markers"
     zone_markers_topic: "/detection/map_markers"
     alert_topic: "/detection/alert"
     web_json_topic: "/detection/web_json"
     camera_frame: "camera_color_optical_frame"
+    base_frame: "base_link"
     map_frame: "map"
     zone_frame: "map"
     model_path: ""
     vehicle_classes: ["car", "truck", "bus", "motorcycle"]
     person_classes: ["person"]
+
+    # 官方 80 类模型：填入指定类别，模型只输出这 5 类
+    target_classes: ["person", "car", "motorcycle", "bus", "truck"]
+
     conf_threshold: 0.5
     iou_threshold: 0.45
     marker_lifetime: 0.5
     embed_image_in_json: false
     show_gui: false
     gui_scale: 0.6
-    result_image_scale: 0.6
-    publish_image: true
+    publish_rviz_markers: true
+    
+    log_fps: true
+    fps_log_interval_sec: 1.0
+
     inference_period_ms: 100
     sync_slop: 0.2
     depth_scale: 0.001
     max_depth: 8.0
-    # 禁停区域多边形 (map 坐标, 米, 扁平坐标 [x1,y1,x2,y2,...])
-    # 例: parking_zone: [1.0, 1.0, 4.0, 1.0, 4.0, 3.0, 1.0, 3.0]
-    # 无地图时 map 与 camera_link 重合, 可用相机附近坐标标定
+
+    tracker_type: "bytetrack"
+    min_consecutive_frames: 15
+    max_miss_frames: 5
+
+    # 车辆节点专属独立多边形区域
+    zones_json: >
+      {
+        "parking_lot": {
+          "polygon": [[1.0, 0.0], [3.0, 0.0], [3.0, 5.0], [1.0, 5.0]],
+          "classes": ["car", "truck", "bus", "person"],
+          "zone_type": "allowed",
+          "violation_name": "illegal_parking_outside_bay",
+          "color": [0.0, 1.0, 0.0, 1.0]
+        },
+        "fire_lane": {
+          "polygon": [[-2.0, -1.0], [-6.0, -1.0], [-6.0, -3.0], [-2.0, -3.0]],
+          "classes": ["car", "truck", "bus", "motorcycle"],
+          "zone_type": "forbidden",
+          "violation_name": "fire_lane_occupation",
+          "color": [1.0, 0.5, 0.0, 1.0]
+        }
+      }
 
 # ------------------- 节点 2: 安全帽 / 安全服 ---------------------------
 helmet_vest_detection_node:
   ros__parameters:
+    map_name: "factory_floor_1"
     color_topic: "/camera/color/image_raw"
     depth_topic: "/camera/depth/image_raw"
     camera_info_topic: "/camera/color/camera_info"
-    result_image_topic: "/detection/ppe_result_image"
     object_markers_topic: "/detection/object_markers"
     zone_markers_topic: "/detection/map_markers"
     alert_topic: "/detection/alert"
     web_json_topic: "/detection/web_json"
     camera_frame: "camera_color_optical_frame"
+    base_frame: "base_link"
     map_frame: "map"
     zone_frame: "map"
     model_path: ""
     ppe_classes: ["Helm", "No_Helm", "No_Vest", "Vest"]
+    
+    # 专用模型：留空 [] 即默认检测该模型下的全部类别
+    target_classes: []
+
     conf_threshold: 0.4
     iou_threshold: 0.45
     marker_lifetime: 0.5
     embed_image_in_json: false
     show_gui: false
     gui_scale: 0.6
-    result_image_scale: 0.6
-    publish_image: true
+    publish_rviz_markers: true
+
+    log_fps: true
+    fps_log_interval_sec: 1.0
+
     inference_period_ms: 100
     sync_slop: 0.2
     depth_scale: 0.001
     max_depth: 8.0
+
+    tracker_type: "bytetrack"
+    min_consecutive_frames: 15
+    max_miss_frames: 5
+
+    zones_json: >
+      {
+        "danger_zone": {
+          "polygon": [[0.0, 0.0], [3.0, 0.0], [3.0, 3.0], [0.0, 3.0]],
+          "classes": ["No_Helm", "No_Vest"],
+          "violation_name": "danger_zone_ppe_violation",
+          "color": [1.0, 0.0, 0.0, 1.0]
+        }
+      }
+
+# ------------------- 节点 3: 火焰检测 ---------------------------------
+fire_detection_node:
+  ros__parameters:
+    map_name: "factory_floor_1"
+    color_topic: "/camera/color/image_raw"
+    depth_topic: "/camera/depth/image_raw"
+    camera_info_topic: "/camera/color/camera_info"
+    object_markers_topic: "/detection/object_markers"
+    zone_markers_topic: "/detection/map_markers"
+    alert_topic: "/detection/alert"
+    web_json_topic: "/detection/web_json"
+    camera_frame: "camera_color_optical_frame"
+    base_frame: "base_link"
+    map_frame: "map"
+    zone_frame: "map"
+    model_path: ""
+    fire_classes: ["fire", "flame"]
+    
+    # 专用模型：留空 [] 默认检测全部
+    target_classes: []
+
+    conf_threshold: 0.4
+    iou_threshold: 0.45
+    marker_lifetime: 0.5
+    embed_image_in_json: false
+    show_gui: false
+    gui_scale: 0.6
+    publish_rviz_markers: true
+
+    log_fps: true
+    fps_log_interval_sec: 1.0
+
+    inference_period_ms: 100
+    sync_slop: 0.2
+    depth_scale: 0.001
+    max_depth: 8.0
+
+    tracker_type: "smooth_kalman"
+    min_consecutive_frames: 15
+    max_miss_frames: 5
+    zones_json: '{}'
+
+# ------------------- 节点 4: 吸烟检测 ---------------------------------
+smoke_detection_node:
+  ros__parameters:
+    map_name: "factory_floor_1"
+    color_topic: "/camera/color/image_raw"
+    depth_topic: "/camera/depth/image_raw"
+    camera_info_topic: "/camera/color/camera_info"
+    object_markers_topic: "/detection/object_markers"
+    zone_markers_topic: "/detection/map_markers"
+    alert_topic: "/detection/alert"
+    web_json_topic: "/detection/web_json"
+    camera_frame: "camera_color_optical_frame"
+    base_frame: "base_link"
+    map_frame: "map"
+    zone_frame: "map"
+    model_path: ""
+    smoke_classes: ["smoke", "smoking", "cigarette"]
+    
+    # 专用模型：留空 [] 默认检测全部
+    target_classes: []
+
+    conf_threshold: 0.4
+    iou_threshold: 0.45
+    marker_lifetime: 0.5
+    embed_image_in_json: false
+    show_gui: false
+    gui_scale: 0.6
+    publish_rviz_markers: true
+
+    log_fps: true
+    fps_log_interval_sec: 1.0
+
+    inference_period_ms: 100
+    sync_slop: 0.2
+    depth_scale: 0.001
+    max_depth: 8.0
+
+    tracker_type: "smooth_kalman"
+    min_consecutive_frames: 15
+    max_miss_frames: 5
+    zones_json: '{}'

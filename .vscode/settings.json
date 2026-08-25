@@ -1,0 +1,5 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "cmake.sourceDirectory": "/home/jetson/Detection_task_ws/src/dog_bringup"
+}

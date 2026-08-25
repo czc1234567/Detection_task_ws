@@ -1,16 +1,12 @@
-# ROS 2 colcon 构建产物
+# 忽略 ROS 编译产物
 build/
 install/
 log/
 
-# Python
-__pycache__/
-*.pyc
-*.egg-info/
-
-# 编辑器/IDE
-.vscode/
-.idea/
-
-# 临时文件
-*.log
+# 忽略 model 目录及权重文件
+**/model/
+**/models/
+*.engine
+*.pt
+*.onnx
+*.weights

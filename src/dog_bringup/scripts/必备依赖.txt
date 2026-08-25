@@ -1,0 +1,3 @@
+需要安装图像压缩插件
+sudo apt update
+sudo apt install ros-humble-compressed-image-transport ros-humble-image-transport-plugins
