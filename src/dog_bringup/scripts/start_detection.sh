@@ -34,10 +34,6 @@ for a in "$@"; do
   esac
 done
 
-ROS_ARGS=""
-[ $SHOW_GUI -eq 1 ] && ROS_ARGS="$ROS_ARGS -p show_gui:=true"
-[ $PUB_RVZ_MARKERS -eq 0 ] && ROS_ARGS="$ROS_ARGS -p publish_rviz_markers:=false"
-
 CONDA_PY=/home/jetson/anaconda3/envs/yolo26/bin/python3
 WS=/home/jetson/Detection_task_ws
 PARAMS=$WS/install/dog_bringup/share/dog_bringup/config/params.yaml
@@ -46,6 +42,13 @@ RVZ_CFG=$WS/install/dog_bringup/share/dog_bringup/config/rviz_detection.rviz
 # 环境源导入
 source /opt/ros/humble/setup.bash
 source $WS/install/setup.bash
+
+# 显式指定本地屏幕输出，确保 Qt/OpenCV 窗口与 RViz 能挂载到桌面
+export DISPLAY=:0
+
+# 布尔值转换 (显式覆盖 params.yaml 中定义的默认参数)
+GUI_BOOL=$([ $SHOW_GUI -eq 1 ] && echo true || echo false)
+MARKER_BOOL=$([ $PUB_RVZ_MARKERS -eq 1 ] && echo true || echo false)
 
 echo "=== 检测启动 (task=$TASK, gui=$SHOW_GUI, rviz=$([ $NO_RVIZ -eq 0 ] && echo on || echo off), markers=$PUB_RVZ_MARKERS) ==="
 
@@ -61,28 +64,40 @@ PIDS="$PIDS $!"
 # 任务 1: 违规停车 (绑定在第 4、5 核)
 if [ "$TASK" = "all" ] || [ "$TASK" = "parking" ]; then
   taskset -c 4,5 $CONDA_PY -m dog_ai_detection.parking_detection_node --ros-args \
-    -r __node:=parking_detection_node --params-file $PARAMS $ROS_ARGS &
+    -r __node:=parking_detection_node \
+    --params-file $PARAMS \
+    -p parking_detection_node:show_gui:=$GUI_BOOL \
+    -p parking_detection_node:publish_rviz_markers:=$MARKER_BOOL &
   PIDS="$PIDS $!"
 fi
 
 # 任务 2: 安全帽/工装 (绑定在第 5、6 核)
 if [ "$TASK" = "all" ] || [ "$TASK" = "ppe" ]; then
   taskset -c 5,6 $CONDA_PY -m dog_ai_detection.helmet_vest_detection_node --ros-args \
-    -r __node:=helmet_vest_detection_node --params-file $PARAMS $ROS_ARGS &
+    -r __node:=helmet_vest_detection_node \
+    --params-file $PARAMS \
+    -p helmet_vest_detection_node:show_gui:=$GUI_BOOL \
+    -p helmet_vest_detection_node:publish_rviz_markers:=$MARKER_BOOL &
   PIDS="$PIDS $!"
 fi
 
 # 任务 3: 火焰检测 (绑定在第 6、7 核)
 if [ "$TASK" = "all" ] || [ "$TASK" = "fire" ]; then
   taskset -c 6,7 $CONDA_PY -m dog_ai_detection.fire_detection_node --ros-args \
-    -r __node:=fire_detection_node --params-file $PARAMS $ROS_ARGS &
+    -r __node:=fire_detection_node \
+    --params-file $PARAMS \
+    -p fire_detection_node:show_gui:=$GUI_BOOL \
+    -p fire_detection_node:publish_rviz_markers:=$MARKER_BOOL &
   PIDS="$PIDS $!"
 fi
 
 # 任务 4: 吸烟检测 (绑定在第 4、7 核)
 if [ "$TASK" = "all" ] || [ "$TASK" = "smoke" ]; then
   taskset -c 4,7 $CONDA_PY -m dog_ai_detection.smoke_detection_node --ros-args \
-    -r __node:=smoke_detection_node --params-file $PARAMS $ROS_ARGS &
+    -r __node:=smoke_detection_node \
+    --params-file $PARAMS \
+    -p smoke_detection_node:show_gui:=$GUI_BOOL \
+    -p smoke_detection_node:publish_rviz_markers:=$MARKER_BOOL &
   PIDS="$PIDS $!"
 fi
 

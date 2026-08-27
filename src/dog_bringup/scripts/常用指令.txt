@@ -1,0 +1,12 @@
+# 1. 强制杀死 4 个专属检测节点进程
+pkill -9 -f parking_detection_node
+pkill -9 -f helmet_vest_detection_node
+pkill -9 -f fire_detection_node
+pkill -9 -f smoke_detection_node
+
+# 2. 杀死相关 bringup 启动脚本与 rviz2
+pkill -9 -f start_detection.sh
+pkill -9 -f rviz2
+
+# 3. 检查是否还有残留占用
+ps aux | grep -E "detection_node|start_detection" | grep -v grep

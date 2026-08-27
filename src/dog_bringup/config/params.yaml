@@ -1,200 +1,221 @@
-# =====================================================================
-# 巡检检测系统集中参数配置
-# 支持: 地图配置、target_classes 类别过滤(可选)、2D 目标跟踪消抖、FPS 输出与区域配置
-# =====================================================================
+# ==============================================================================
+# ROS 2 多任务 AI 视觉检测全局参数配置
+# ==============================================================================
 
-# ------------------- 节点 1: 车辆违规停放 + 行人 -----------------------
+/**:
+  ros__parameters:
+    use_sim_time: false
+
+# ------------------------------------------------------------------------------
+# 1. 违规停放与行人检测节点
+# ------------------------------------------------------------------------------
 parking_detection_node:
   ros__parameters:
     map_name: "factory_floor_1"
     color_topic: "/camera/color/image_raw"
     depth_topic: "/camera/depth/image_raw"
     camera_info_topic: "/camera/color/camera_info"
-    object_markers_topic: "/detection/object_markers"
-    zone_markers_topic: "/detection/map_markers"
-    alert_topic: "/detection/alert"
-    web_json_topic: "/detection/web_json"
+    
+    # 专属隔离话题
+    object_markers_topic: "/detection/parking/object_markers"
+    zone_markers_topic: "/detection/parking/map_markers"
+    alert_topic: "/detection/parking/alert"
+    web_json_topic: "/detection/parking/web_json"
+    
     camera_frame: "camera_color_optical_frame"
     base_frame: "base_link"
     map_frame: "map"
     zone_frame: "map"
-    model_path: ""
+    
+    model_path: "yolo26n.engine"
+    target_classes: ["person", "car", "truck", "bus", "motorcycle"]
     vehicle_classes: ["car", "truck", "bus", "motorcycle"]
     person_classes: ["person"]
-
-    # 官方 80 类模型：填入指定类别，模型只输出这 5 类
-    target_classes: ["person", "car", "motorcycle", "bus", "truck"]
-
-    conf_threshold: 0.5
+    
+    conf_threshold: 0.45
     iou_threshold: 0.45
-    marker_lifetime: 0.5
-    embed_image_in_json: false
-    show_gui: false
-    gui_scale: 0.6
+    marker_lifetime: 1.5
     publish_rviz_markers: true
+    show_gui: true
+    gui_scale: 0.6
     
     log_fps: true
     fps_log_interval_sec: 1.0
-
-    inference_period_ms: 100
+    inference_period_ms: 30
     sync_slop: 0.2
     depth_scale: 0.001
     max_depth: 8.0
-
+    
     tracker_type: "bytetrack"
-    min_consecutive_frames: 15
+    min_consecutive_frames: 10
     max_miss_frames: 5
 
-    # 车辆节点专属独立多边形区域
+    # 违停禁区定义
     zones_json: >
       {
-        "parking_lot": {
-          "polygon": [[1.0, 0.0], [3.0, 0.0], [3.0, 5.0], [1.0, 5.0]],
-          "classes": ["car", "truck", "bus", "person"],
-          "zone_type": "allowed",
-          "violation_name": "illegal_parking_outside_bay",
-          "color": [0.0, 1.0, 0.0, 1.0]
-        },
-        "fire_lane": {
-          "polygon": [[-2.0, -1.0], [-6.0, -1.0], [-6.0, -3.0], [-2.0, -3.0]],
+        "no_parking_zone_a": {
+          "polygon": [[1.0, 1.0], [5.0, 1.0], [5.0, 4.0], [1.0, 4.0]],
           "classes": ["car", "truck", "bus", "motorcycle"],
           "zone_type": "forbidden",
-          "violation_name": "fire_lane_occupation",
-          "color": [1.0, 0.5, 0.0, 1.0]
+          "violation_name": "车辆违规停放",
+          "color": [1.0, 0.0, 0.0, 0.4]
+        },
+        "pedestrian_forbidden_zone": {
+          "polygon": [[1.0, 1.0], [5.0, 1.0], [5.0, 4.0], [1.0, 4.0]],
+          "classes": ["person"],
+          "zone_type": "forbidden",
+          "violation_name": "行人危险区域闯入",
+          "color": [1.0, 0.5, 0.0, 0.4]
         }
       }
 
-# ------------------- 节点 2: 安全帽 / 安全服 ---------------------------
+# ------------------------------------------------------------------------------
+# 2. 安全帽 / 安全工装检测节点
+# ------------------------------------------------------------------------------
 helmet_vest_detection_node:
   ros__parameters:
     map_name: "factory_floor_1"
     color_topic: "/camera/color/image_raw"
     depth_topic: "/camera/depth/image_raw"
     camera_info_topic: "/camera/color/camera_info"
-    object_markers_topic: "/detection/object_markers"
-    zone_markers_topic: "/detection/map_markers"
-    alert_topic: "/detection/alert"
-    web_json_topic: "/detection/web_json"
+    
+    object_markers_topic: "/detection/ppe/object_markers"
+    zone_markers_topic: "/detection/ppe/map_markers"
+    alert_topic: "/detection/ppe/alert"
+    web_json_topic: "/detection/ppe/web_json"
+    
     camera_frame: "camera_color_optical_frame"
     base_frame: "base_link"
     map_frame: "map"
     zone_frame: "map"
-    model_path: ""
-    ppe_classes: ["Helm", "No_Helm", "No_Vest", "Vest"]
     
-    # 专用模型：留空 [] 即默认检测该模型下的全部类别
+    model_path: "helmet.engine"
+    ppe_classes: ["Helm", "No_Helm", "No_Vest", "Vest"]
     target_classes: []
-
-    conf_threshold: 0.4
+    
+    conf_threshold: 0.45
     iou_threshold: 0.45
-    marker_lifetime: 0.5
-    embed_image_in_json: false
-    show_gui: false
-    gui_scale: 0.6
+    marker_lifetime: 1.5
     publish_rviz_markers: true
-
+    show_gui: true
+    gui_scale: 0.6
+    
     log_fps: true
     fps_log_interval_sec: 1.0
-
-    inference_period_ms: 100
+    inference_period_ms: 30
     sync_slop: 0.2
     depth_scale: 0.001
     max_depth: 8.0
-
-    tracker_type: "bytetrack"
-    min_consecutive_frames: 15
+    
+    tracker_type: "smooth_kalman"
+    min_consecutive_frames: 10
     max_miss_frames: 5
 
+    # 施工作业穿戴管控区
     zones_json: >
       {
-        "danger_zone": {
-          "polygon": [[0.0, 0.0], [3.0, 0.0], [3.0, 3.0], [0.0, 3.0]],
+        "construction_ppe_zone": {
+          "polygon": [[-3.0, -1.0], [3.0, -1.0], [3.0, 5.0], [-3.0, 5.0]],
           "classes": ["No_Helm", "No_Vest"],
-          "violation_name": "danger_zone_ppe_violation",
-          "color": [1.0, 0.0, 0.0, 1.0]
+          "zone_type": "forbidden",
+          "violation_name": "未规范穿戴安全防护装备",
+          "color": [1.0, 0.5, 0.0, 0.4]
         }
       }
 
-# ------------------- 节点 3: 火焰检测 ---------------------------------
+# ------------------------------------------------------------------------------
+# 3. 火焰检测节点
+# ------------------------------------------------------------------------------
 fire_detection_node:
   ros__parameters:
     map_name: "factory_floor_1"
     color_topic: "/camera/color/image_raw"
     depth_topic: "/camera/depth/image_raw"
     camera_info_topic: "/camera/color/camera_info"
-    object_markers_topic: "/detection/object_markers"
-    zone_markers_topic: "/detection/map_markers"
-    alert_topic: "/detection/alert"
-    web_json_topic: "/detection/web_json"
+    
+    object_markers_topic: "/detection/fire/object_markers"
+    zone_markers_topic: "/detection/fire/map_markers"
+    alert_topic: "/detection/fire/alert"
+    web_json_topic: "/detection/fire/web_json"
+    
     camera_frame: "camera_color_optical_frame"
     base_frame: "base_link"
     map_frame: "map"
     zone_frame: "map"
-    model_path: ""
-    fire_classes: ["fire", "flame"]
     
-    # 专用模型：留空 [] 默认检测全部
+    model_path: "fire_detector.engine"
+    fire_classes: ["fire", "flame"]
     target_classes: []
-
-    conf_threshold: 0.4
+    
+    conf_threshold: 0.50
     iou_threshold: 0.45
-    marker_lifetime: 0.5
-    embed_image_in_json: false
-    show_gui: false
-    gui_scale: 0.6
+    marker_lifetime: 1.5
     publish_rviz_markers: true
-
+    show_gui: true
+    gui_scale: 0.6
+    
     log_fps: true
     fps_log_interval_sec: 1.0
-
-    inference_period_ms: 100
+    inference_period_ms: 40
     sync_slop: 0.2
     depth_scale: 0.001
     max_depth: 8.0
-
+    
     tracker_type: "smooth_kalman"
-    min_consecutive_frames: 15
-    max_miss_frames: 5
-    zones_json: '{}'
+    min_consecutive_frames: 6
+    max_miss_frames: 4
+    zones_json: "{}"
 
-# ------------------- 节点 4: 吸烟检测 ---------------------------------
+# ------------------------------------------------------------------------------
+# 4. 吸烟行为检测节点 (已开启区域化管控)
+# ------------------------------------------------------------------------------
 smoke_detection_node:
   ros__parameters:
     map_name: "factory_floor_1"
     color_topic: "/camera/color/image_raw"
     depth_topic: "/camera/depth/image_raw"
     camera_info_topic: "/camera/color/camera_info"
-    object_markers_topic: "/detection/object_markers"
-    zone_markers_topic: "/detection/map_markers"
-    alert_topic: "/detection/alert"
-    web_json_topic: "/detection/web_json"
+    
+    object_markers_topic: "/detection/smoke/object_markers"
+    zone_markers_topic: "/detection/smoke/map_markers"
+    alert_topic: "/detection/smoke/alert"
+    web_json_topic: "/detection/smoke/web_json"
+    
     camera_frame: "camera_color_optical_frame"
     base_frame: "base_link"
     map_frame: "map"
     zone_frame: "map"
-    model_path: ""
-    smoke_classes: ["smoke", "smoking", "cigarette"]
     
-    # 专用模型：留空 [] 默认检测全部
+    model_path: "smoking.engine"
+    smoke_classes: ["smoke", "smoking", "cigarette"]
     target_classes: []
-
-    conf_threshold: 0.4
+    
+    conf_threshold: 0.45
     iou_threshold: 0.45
-    marker_lifetime: 0.5
-    embed_image_in_json: false
-    show_gui: false
-    gui_scale: 0.6
+    marker_lifetime: 1.5
     publish_rviz_markers: true
-
+    show_gui: true
+    gui_scale: 0.6
+    
     log_fps: true
     fps_log_interval_sec: 1.0
-
-    inference_period_ms: 100
+    inference_period_ms: 40
     sync_slop: 0.2
     depth_scale: 0.001
     max_depth: 8.0
-
+    
     tracker_type: "smooth_kalman"
-    min_consecutive_frames: 15
-    max_miss_frames: 5
-    zones_json: '{}'
+    min_consecutive_frames: 8
+    max_miss_frames: 4
+
+    # 易燃易爆严禁吸烟管控区
+    zones_json: >
+      {
+        "smoking_forbidden_zone_1": {
+          "polygon": [[-5.0, 2.0], [-1.0, 2.0], [-1.0, 6.0], [-5.0, 6.0]],
+          "classes": ["smoke", "smoking", "cigarette"],
+          "zone_type": "forbidden",
+          "violation_name": "核心禁烟区违规吸烟",
+          "color": [1.0, 0.0, 0.8, 0.4]
+        }
+      }

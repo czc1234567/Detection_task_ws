@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""节点 1: 车辆违规停放检测."""
+"""节点 1: 车辆违规停放与行人检测."""
 
+import sys
+import time
+import signal
+import threading
+import numpy as np
+import cv2
 import rclpy
-from rclpy.executors import ExternalShutdownException
+from rclpy.executors import MultiThreadedExecutor
 from dog_ai_detection.detection_core import BaseVizDetectionNode
 
 
@@ -33,17 +39,58 @@ class ParkingDetectionNode(BaseVizDetectionNode):
 def main(args=None):
     rclpy.init(args=args)
     node = ParkingDetectionNode()
+
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+    ros_thread = threading.Thread(target=executor.spin, daemon=True)
+    ros_thread.start()
+
+    running = True
+    def stop_signal(sig, frame):
+        nonlocal running
+        running = False
+    signal.signal(signal.SIGINT, stop_signal)
+
+    win_name = f"Detection - {node.get_name()}"
+    if node.show_gui:
+        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win_name, 640, 360)
+        cv2.moveWindow(win_name, 50, 50)  # 左上角
+        
+        # 刷入初始帧，立刻激活 X11 窗口渲染
+        init_frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        cv2.putText(init_frame, f"Waiting for {node.get_name()}...", (30, 180),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+        cv2.imshow(win_name, init_frame)
+        cv2.waitKey(1)
+
     try:
-        rclpy.spin(node)
-    except (KeyboardInterrupt, ExternalShutdownException):
+        while running and rclpy.ok():
+            show_frame = None
+            with node._frame_lock:
+                if node.display_frame is not None:
+                    show_frame = node.display_frame
+
+            if node.show_gui:
+                if show_frame is not None:
+                    cv2.imshow(win_name, show_frame)
+                # 无论是否拿到新帧，必须调用 waitKey 驱动 X11 事件循环
+                key = cv2.waitKey(10) & 0xFF
+                if key == ord('q'):
+                    break
+            else:
+                time.sleep(0.01)
+
+    except KeyboardInterrupt:
         pass
     finally:
+        node.running = False
+        executor.shutdown()
+        if node.show_gui:
+            cv2.destroyWindow(win_name)
         node.destroy_node()
-        if rclpy.ok():
-            try:
-                rclpy.shutdown()
-            except Exception:
-                pass
+        rclpy.shutdown()
+        sys.exit(0)
 
 
 if __name__ == '__main__':

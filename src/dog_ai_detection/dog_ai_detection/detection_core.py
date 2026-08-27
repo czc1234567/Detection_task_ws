@@ -3,7 +3,7 @@
 """
 dog_ai_detection.detection_core
 ===============================
-共享检测核心 (彻底修复参数未初始化异常、支持可选类别过滤、2D YOLO 目标多算法跟踪消抖、允许/禁区判定与前端 Web JSON 消息发布)
+共享检测核心 (修复多线程死锁、剥离主线程 GUI、防止 CUDA 并发堆积、2D 目标跟踪消抖与 3D 反投影)
 """
 
 import os
@@ -327,7 +327,6 @@ class BaseVizDetectionNode(Node):
         self.declare_parameter('zone_frame', 'map')
         self.declare_parameter('model_path', '')
 
-        # 使用带字符串原型的默认值，既定义 STRING_ARRAY 类型又赋予初始空列表，解决所有类型报错
         self.declare_parameter('class_names', [''])
         self.declare_parameter('target_classes', [''])
 
@@ -336,14 +335,14 @@ class BaseVizDetectionNode(Node):
         self.declare_parameter('marker_lifetime', 0.5)
         self.declare_parameter('embed_image_in_json', False)
         
-        self.declare_parameter('show_gui', False)
+        self.declare_parameter('show_gui', True)
         self.declare_parameter('gui_scale', 0.6)
         self.declare_parameter('publish_rviz_markers', True)
         
         self.declare_parameter('log_fps', True)
         self.declare_parameter('fps_log_interval_sec', 1.0)
         
-        self.declare_parameter('inference_period_ms', 100)
+        self.declare_parameter('inference_period_ms', 60)
         self.declare_parameter('sync_slop', 0.2)
         self.declare_parameter('depth_scale', 0.001)
         self.declare_parameter('max_depth', 8.0)
@@ -364,9 +363,16 @@ class BaseVizDetectionNode(Node):
         self._header = None
         self._fx = self._fy = self._cx = self._cy = None
         
+        # 线程同步与防卡死锁
         self._frame_lock = threading.Lock()
         self._frame_seq = 0
         self._processed_seq = -1
+        self._is_inferring = False
+        self.running = True
+
+        # 主线程专属显示缓冲区
+        self.display_frame = None
+
         self._encoder = ThreadPoolExecutor(max_workers=2)
         self._encode_busy = False
 
@@ -378,7 +384,6 @@ class BaseVizDetectionNode(Node):
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
-        # 实例化 2D 目标跟踪器
         self._tracker = build_tracker(
             tracker_type=self.tracker_type,
             min_hits=self.min_consecutive_frames,
@@ -414,6 +419,7 @@ class BaseVizDetectionNode(Node):
         self._alert_pub = self.create_publisher(Bool, self.alert_topic, 10)
         self._json_pub = self.create_publisher(String, self.web_json_topic, 10)
 
+        # 启动定时推理循环
         self._timer = self.create_timer(self.inference_period_ms / 1000.0, self._process_tick)
         self.get_logger().info(f'[{self.get_name()}] Started on map: {self.map_name}')
 
@@ -476,7 +482,6 @@ class BaseVizDetectionNode(Node):
         self.map_frame = self.get_parameter('map_frame').value
         self.zone_frame = self.get_parameter('zone_frame').value
         
-        # 安全取值，过滤空字符串占位符
         try:
             raw_c = self.get_parameter('class_names').value
             self.class_names = [str(c) for c in (list(raw_c) if raw_c else []) if str(c).strip()]
@@ -526,6 +531,8 @@ class BaseVizDetectionNode(Node):
         self._cx, self._cy = float(msg.k[2]), float(msg.k[5])
 
     def _image_sync_cb(self, color_msg, depth_msg):
+        if not self.running:
+            return
         try:
             color = self._bridge.imgmsg_to_cv2(color_msg, 'bgr8')
             if depth_msg.encoding in ('16UC1', 'mono16'):
@@ -556,6 +563,7 @@ class BaseVizDetectionNode(Node):
         m.action = Marker.ADD
         m.pose.position.x, m.pose.position.y = float(pose[0]), float(pose[1])
         m.pose.position.z = float(pose[2]) if len(pose) > 2 else 0.0
+        m.pose.orientation.w = 1.0  # 赋合法四元数，防止 RViz2 报警
         m.scale.x, m.scale.y, m.scale.z = float(scale[0]), float(scale[1]), float(scale[2])
         m.color.r, m.color.g, m.color.b, m.color.a = (
             float(color[0]), float(color[1]), float(color[2]), float(color[3]))
@@ -617,27 +625,43 @@ class BaseVizDetectionNode(Node):
             if cls_name not in g['classes']:
                 continue
 
-            if g.get('violation_classes') and cls_name in g['violation_classes']:
-                return True, cls_name
+            is_vio_class = bool(g.get('violation_classes') and cls_name in g['violation_classes'])
+            needs_zones = bool(g.get('zones'))
 
-            if g.get('zones') and mx is not None:
+            # 情况 A: 开启了区域判定 (如 PPE、停车、吸烟管控区)
+            if needs_zones:
+                if mx is None or my is None:
+                    # 如果没有深度或TF坐标，无法判断区域，默认暂不违规
+                    return False, None
+
                 pt = (float(mx), float(my))
                 for zname, zcfg in self.zones_dict.items():
-                    if not zcfg['classes'] or cls_name in zcfg['classes']:
+                    # 检查类别是否受此区域管控
+                    target_zone_classes = zcfg.get('classes', [])
+                    if not target_zone_classes or cls_name in target_zone_classes:
                         inside = (cv2.pointPolygonTest(zcfg['np_poly'], pt, False) >= 0)
                         zone_type = zcfg.get('zone_type', 'forbidden')
 
-                        if zone_type == 'allowed':
+                        if zone_type == 'forbidden':
+                            # 禁区模式: 在框内就算违规 (如果是 PPE，还要求属于 No_Helm 等违规类)
+                            if inside and (is_vio_class or not g.get('violation_classes')):
+                                return True, zcfg['violation_name']
+                        elif zone_type == 'allowed':
+                            # 准入模式: 出框就算违规
                             if not inside:
                                 return True, zcfg['violation_name']
-                        elif zone_type == 'forbidden':
-                            if inside:
-                                return True, zcfg['violation_name']
+                
+                # 如果开启了 zones 但不在任何违规区域内，判定为正常(返回 False)
+                return False, None
+
+            # 情况 B: 全局无区域限制的违规判定 (如全局火焰检测 zones=False)
+            if is_vio_class:
+                return True, cls_name
 
         return False, None
 
     def _process_tick(self):
-        if not rclpy.ok() or self._fx is None:
+        if not self.running or not rclpy.ok() or self._fx is None or self._is_inferring:
             return
 
         tick_start = time.time()
@@ -650,71 +674,74 @@ class BaseVizDetectionNode(Node):
             is_meters = self._depth_is_meters
             self._processed_seq = self._frame_seq
 
-        raw_dets = self._engine.infer(frame)
-        frame_tf = self._lookup_frame_tf(self.map_frame, self.camera_frame)
+        self._is_inferring = True
+        try:
+            raw_dets = self._engine.infer(frame)
+            frame_tf = self._lookup_frame_tf(self.map_frame, self.camera_frame)
 
-        # 1. 预先计算所有检测框的空间 3D 坐标
-        det_map_pos = {}
-        for i, det in enumerate(raw_dets):
-            x1, y1, x2, y2 = [int(v) for v in det['bbox'][:4]]
-            depth_m = self._depth_at_center(x1, y1, x2, y2, depth_mat, is_meters)
-            if depth_m is not None and frame_tf is not None:
-                cam = self._to_camera_3d(x1, y1, x2, y2, depth_m)
-                mapp = self._transform_point_to_map(*cam, frame_tf)
-                if mapp:
-                    det_map_pos[i] = mapp
+            det_map_pos = {}
+            for i, det in enumerate(raw_dets):
+                x1, y1, x2, y2 = [int(v) for v in det['bbox'][:4]]
+                depth_m = self._depth_at_center(x1, y1, x2, y2, depth_mat, is_meters)
+                if depth_m is not None and frame_tf is not None:
+                    cam = self._to_camera_3d(x1, y1, x2, y2, depth_m)
+                    mapp = self._transform_point_to_map(*cam, frame_tf)
+                    if mapp:
+                        det_map_pos[i] = mapp
 
-        # 2. 方案 A：构造闭包评估函数供 Tracker 内部调用
-        def violation_eval_fn(det_item):
-            idx = raw_dets.index(det_item) if det_item in raw_dets else -1
-            mx, my = (det_map_pos[idx][0], det_map_pos[idx][1]) if idx in det_map_pos else (None, None)
-            return self._evaluate_detection_violation(det_item, mx, my)
+            def violation_eval_fn(det_item):
+                idx = raw_dets.index(det_item) if det_item in raw_dets else -1
+                mx, my = (det_map_pos[idx][0], det_map_pos[idx][1]) if idx in det_map_pos else (None, None)
+                return self._evaluate_detection_violation(det_item, mx, my)
 
-        # 3. 传入 raw_dets 与 violation_eval_fn
-        active_tracks, confirmed_violations = self._tracker.step(raw_dets, violation_eval_fn)
+            active_tracks, confirmed_violations = self._tracker.step(raw_dets, violation_eval_fn)
 
-        markers = MarkerArray()
-        frontend_objects = []
+            markers = MarkerArray()
 
-        for trk in active_tracks:
-            x1, y1, x2, y2 = [int(v) for v in trk.kf.get_state()]
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+            # delete_marker = Marker()
+            # delete_marker.action = Marker.DELETEALL
+            # markers.markers.append(delete_marker)
 
-            # 获取匹配到的 3D 坐标
-            depth_m = self._depth_at_center(x1, y1, x2, y2, depth_mat, is_meters)
-            mx, my, mz = None, None, None
-            if depth_m is not None and frame_tf is not None:
-                cam = self._to_camera_3d(x1, y1, x2, y2, depth_m)
-                mapp = self._transform_point_to_map(*cam, frame_tf)
-                if mapp:
-                    mx, my, mz = mapp
+            frontend_objects = []
 
-            is_confirmed = trk.is_confirmed_violation
-            hits = trk.violation_consecutive_hits
+            for trk in active_tracks:
+                x1, y1, x2, y2 = [int(v) for v in trk.kf.get_state()]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
 
-            obj_data = {
-                'track_id': trk.track_id,
-                'class_name': trk.class_name,
-                'confidence': round(trk.score, 3),
-                'bbox_2d': [x1, y1, x2, y2],
-                'map_position': {
-                    'x': round(mx, 3),
-                    'y': round(my, 3),
-                    'z': round(mz, 3)
-                } if mx is not None else None,
-                'distance_to_dog': round(depth_m, 2) if depth_m is not None else None,
-                'violation_info': {
-                    'is_violation': is_confirmed,
-                    'violation_type': trk.current_violation_type,
-                    'consecutive_hits': hits,
-                    'min_consecutive_frames': self.min_consecutive_frames,
-                    'status': 'confirmed' if is_confirmed else ('buffering' if hits > 0 else 'normal')
+                depth_m = self._depth_at_center(x1, y1, x2, y2, depth_mat, is_meters)
+                mx, my, mz = None, None, None
+                if depth_m is not None and frame_tf is not None:
+                    cam = self._to_camera_3d(x1, y1, x2, y2, depth_m)
+                    mapp = self._transform_point_to_map(*cam, frame_tf)
+                    if mapp:
+                        mx, my, mz = mapp
+
+                is_confirmed = trk.is_confirmed_violation
+                hits = trk.violation_consecutive_hits
+
+                obj_data = {
+                    'track_id': trk.track_id,
+                    'class_name': trk.class_name,
+                    'confidence': round(trk.score, 3),
+                    'bbox_2d': [x1, y1, x2, y2],
+                    'map_position': {
+                        'x': round(mx, 3),
+                        'y': round(my, 3),
+                        'z': round(mz, 3)
+                    } if mx is not None else None,
+                    'distance_to_dog': round(depth_m, 2) if depth_m is not None else None,
+                    'violation_info': {
+                        'is_violation': is_confirmed,
+                        'violation_type': trk.current_violation_type,
+                        'consecutive_hits': hits,
+                        'min_consecutive_frames': self.min_consecutive_frames,
+                        'status': 'confirmed' if is_confirmed else ('buffering' if hits > 0 else 'normal')
+                    }
                 }
-            }
-            frontend_objects.append(obj_data)
+                frontend_objects.append(obj_data)
 
-            if self.show_gui:
+                # 绘制 2D 追踪与违规状态
                 color = (0, 0, 255) if is_confirmed else (0, 165, 255)
                 label = f"ID:{trk.track_id} {trk.class_name} [{hits}/{self.min_consecutive_frames}]"
                 if depth_m is not None:
@@ -725,82 +752,77 @@ class BaseVizDetectionNode(Node):
                 ty = max(y1 - 6, 12)
                 cv2.putText(frame, label, (x1, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
 
-            if self.publish_rviz_markers and mx is not None:
-                bw = (x2 - x1) * depth_m / self._fx
-                bh = (y2 - y1) * depth_m / self._fy
-                rgba = (1.0, 0.0, 0.0, 0.8) if is_confirmed else (1.0, 0.65, 0.0, 0.7)
-                markers.markers.append(self._create_marker(
-                    Marker.CUBE, trk.track_id * 2, (mx, my, depth_m / 2.0),
-                    (max(bw, 0.2), max(bh, 0.2), 0.2), rgba,
-                    ns=f"{self.get_name()}_objs", frame_id=self.map_frame))
-                markers.markers.append(self._create_marker(
-                    Marker.TEXT_VIEW_FACING, trk.track_id * 2 + 1,
-                    (mx, my, depth_m / 2.0 + 0.35), (0, 0, 0.35),
-                    (1.0, 1.0, 1.0, 1.0), ns=f"{self.get_name()}_lbls",
-                    frame_id=self.map_frame, text=f"ID:{trk.track_id} {trk.class_name}"))
+                if self.publish_rviz_markers and mx is not None:
+                    bw = (x2 - x1) * depth_m / self._fx
+                    bh = (y2 - y1) * depth_m / self._fy
+                    rgba = (1.0, 0.0, 0.0, 0.8) if is_confirmed else (1.0, 0.65, 0.0, 0.7)
+                    
+                    # 1. 修改 3D 方框 Marker 的 ns (加上节点名前缀)
+                    markers.markers.append(self._create_marker(
+                        Marker.CUBE, trk.track_id * 2, (mx, my, depth_m / 2.0),
+                        (max(bw, 0.2), max(bh, 0.2), 0.2), rgba,
+                        ns=f"{self.get_name()}_objs", frame_id=self.map_frame))  # <-- 在这里
+                    
+                    # 2. 如果保留了 3D 文字 Marker，同样修改这里的 ns
+                    markers.markers.append(self._create_marker(
+                        Marker.TEXT_VIEW_FACING, trk.track_id * 2 + 1,
+                        (mx, my, depth_m / 2.0 + 0.35), (0, 0, 0.35),
+                        (1.0, 1.0, 1.0, 1.0), 
+                        ns=f"{self.get_name()}_lbls", frame_id=self.map_frame,   # <-- 在这里
+                        text=f"ID:{trk.track_id} {trk.class_name}"))
 
-        if self.publish_rviz_markers:
-            self._marker_pub.publish(markers)
+            if self.publish_rviz_markers:
+                self._marker_pub.publish(markers)
 
-        now = time.time()
-        duration_ms = (now - tick_start) * 1000.0
-        self._fps_timestamps.append(now)
-        self._fps_durations.append(duration_ms)
+            now = time.time()
+            duration_ms = (now - tick_start) * 1000.0
+            self._fps_timestamps.append(now)
+            self._fps_durations.append(duration_ms)
 
-        if len(self._fps_timestamps) > 1:
-            time_diff = self._fps_timestamps[-1] - self._fps_timestamps[0]
-            if time_diff > 0:
-                self._current_fps = (len(self._fps_timestamps) - 1) / time_diff
+            if len(self._fps_timestamps) > 1:
+                time_diff = self._fps_timestamps[-1] - self._fps_timestamps[0]
+                if time_diff > 0:
+                    self._current_fps = (len(self._fps_timestamps) - 1) / time_diff
 
-        if self.log_fps and (now - self._last_fps_log_time >= self.fps_log_interval_sec):
-            avg_cost = np.mean(self._fps_durations) if self._fps_durations else 0.0
-            self.get_logger().info(
-                f"[PERF] FPS: {self._current_fps:.1f} | Latency: {avg_cost:.1f}ms | Tracked: {len(active_tracks)}"
-            )
-            self._last_fps_log_time = now
+            if self.log_fps and (now - self._last_fps_log_time >= self.fps_log_interval_sec):
+                avg_cost = np.mean(self._fps_durations) if self._fps_durations else 0.0
+                self.get_logger().info(
+                    f"[PERF] FPS: {self._current_fps:.1f} | Latency: {avg_cost:.1f}ms | Tracked: {len(active_tracks)}"
+                )
+                self._last_fps_log_time = now
 
-        if self.show_gui:
             fps_text = f"FPS: {self._current_fps:.1f}"
             cv2.putText(frame, fps_text, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            self._show_gui(frame)
 
-        if len(confirmed_violations) > 0:
-            self._alert_pub.publish(Bool(data=True))
+            # 更新主线程显示帧，彻底不在 ROS 回调子线程中调用 cv2.imshow
+            with self._frame_lock:
+                self.display_frame = frame
 
-        robot_pose = self._get_robot_pose()
-        payload = {
-            'map_name': self.map_name,
-            'node': self.get_name(),
-            'timestamp': int(self.get_clock().now().nanoseconds / 1e9),
-            'robot_pose': robot_pose,
-            'summary': {
-                'total_tracked': len(frontend_objects),
-                'confirmed_violations_count': len(confirmed_violations),
-            },
-            'detections': frontend_objects
-        }
+            if len(confirmed_violations) > 0:
+                self._alert_pub.publish(Bool(data=True))
 
-        if self.embed_image_in_json:
-            if not self._encode_busy:
-                self._encode_busy = True
-                self._encoder.submit(self._encode_and_publish, frame.copy(), payload)
-        else:
-            self._json_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
+            robot_pose = self._get_robot_pose()
+            payload = {
+                'map_name': self.map_name,
+                'node': self.get_name(),
+                'timestamp': int(self.get_clock().now().nanoseconds / 1e9),
+                'robot_pose': robot_pose,
+                'summary': {
+                    'total_tracked': len(frontend_objects),
+                    'confirmed_violations_count': len(confirmed_violations),
+                },
+                'detections': frontend_objects
+            }
 
-    @staticmethod
-    def _resize(frame, scale):
-        if scale >= 1.0:
-            return frame
-        w = max(1, int(frame.shape[1] * scale))
-        h = max(1, int(frame.shape[0] * scale))
-        return cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+            if self.embed_image_in_json:
+                if not self._encode_busy:
+                    self._encode_busy = True
+                    self._encoder.submit(self._encode_and_publish, frame.copy(), payload)
+            else:
+                self._json_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
 
-    def _show_gui(self, frame):
-        view = self._resize(frame, self.gui_scale)
-        cv2.imshow(f'Detection - {self.get_name()}', view)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            self.get_logger().info('GUI: q pressed, shutting down')
-            raise KeyboardInterrupt
+        finally:
+            self._is_inferring = False
 
     def _encode_and_publish(self, frame, payload):
         try:
@@ -815,12 +837,15 @@ class BaseVizDetectionNode(Node):
             self._encode_busy = False
 
     def destroy_node(self):
+        self.running = False
+        if hasattr(self, '_timer') and self._timer is not None:
+            self._timer.cancel()
         if getattr(self, '_encoder', None) is not None:
             self._encoder.shutdown(wait=False, cancel_futures=True)
         super().destroy_node()
 
     def _publish_zones(self):
-        if not rclpy.ok() or not self.publish_rviz_markers:
+        if not self.running or not rclpy.ok() or not self.publish_rviz_markers:
             return
         arr = MarkerArray()
         idx = 0
