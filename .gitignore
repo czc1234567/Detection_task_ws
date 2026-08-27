@@ -10,3 +10,5 @@ log/
 *.pt
 *.onnx
 *.weights
+__pycache__/
+*.pyc
